@@ -7,7 +7,9 @@ instances that are only mentioned, methods used only for QC, upstream
 quantification steps, instruments, and so on. This registry applies the *record
 layer* of the project scope and aggregates the survivors by canonical name:
 
-  record kept  iff  pmid is in included_pmids_422.txt
+  record kept  iff  pmid is in included_pmids_405.txt
+                    (current upstream inclusion set; the 422 list is a
+                    superseded snapshot kept for historical reproduction)
                     and the pmid is not retracted (DEFAULT_RETRACTIONS)
                     and record["in_scope"] is True
                     and record["method_class"] == "computational"
@@ -580,7 +582,7 @@ class MethodRegistry:
                 "method_class": "computational",
                 "scope": {
                     "in_scope": True,
-                    "basis": "included_pmids_422 minus retractions",
+                    "basis": "included_pmids_405 minus retractions",
                 },
                 "corpus": {
                     "n_instances": len(evidence),
@@ -639,14 +641,18 @@ class MethodRegistry:
             "n_records_qualifying": n_qualifying,
         }
 
-        from scope_knowledge import KNOWN_PMID_LIST_SHA256
+        from scope_knowledge import KNOWN_PMID_LIST_SHA256, KNOWN_PMID_LIST_SNAPSHOTS
 
         list_matches_known = list_sha == KNOWN_PMID_LIST_SHA256
+        known_snapshot = KNOWN_PMID_LIST_SNAPSHOTS.get(list_sha)
         self._scope = {
             "pmid_list_path": str(self.pmid_list_path),
             "pmid_list_sha256": list_sha,
             "pmid_list_sha256_16": list_sha[:16],
             "pmid_list_known_sha256": KNOWN_PMID_LIST_SHA256,
+            "pmid_list_known_snapshot": (
+                dict(known_snapshot) if known_snapshot is not None else None
+            ),
             "pmid_list_matches_known": list_matches_known,
             "n_included_pmids": len(included),
             "n_duplicate_pmids": len(duplicate_pmids),
@@ -709,11 +715,20 @@ class MethodRegistry:
             "and count, not used to filter methods out.",
         ]
         if not list_matches_known:
-            self._notes.append(
-                "included PMID list sha256 differs from the recorded snapshot; "
-                "the configured list is authoritative and the registry scope "
-                "follows it."
-            )
+            if known_snapshot is not None and known_snapshot.get("status") == "superseded":
+                self._notes.append(
+                    f"included PMID list is the {known_snapshot.get('label')} "
+                    f"snapshot, superseded {known_snapshot.get('superseded')} by "
+                    f"{known_snapshot.get('superseded_by')}; the configured list "
+                    "is authoritative, so these counts describe historical "
+                    "scope, not the current inclusion set."
+                )
+            else:
+                self._notes.append(
+                    "included PMID list sha256 differs from the recorded snapshot; "
+                    "the configured list is authoritative and the registry scope "
+                    "follows it."
+                )
         if duplicate_pmids:
             self._notes.append(
                 f"included PMID list contained {len(duplicate_pmids)} duplicate line(s)."
@@ -1088,6 +1103,11 @@ class MethodRegistry:
             "pmid_list_path": self._scope["pmid_list_path"],
             "pmid_list_sha256": self._scope["pmid_list_sha256"],
             "pmid_list_sha256_16": self._scope["pmid_list_sha256_16"],
+            "pmid_list_known_sha256": self._scope["pmid_list_known_sha256"],
+            "pmid_list_known_snapshot": (
+                dict(self._scope["pmid_list_known_snapshot"])
+                if self._scope["pmid_list_known_snapshot"] is not None else None
+            ),
             "pmid_list_matches_known": self._scope["pmid_list_matches_known"],
             "n_included_pmids": self._scope["n_included_pmids"],
             "n_retracted_pmids": self._scope["n_retracted_pmids"],

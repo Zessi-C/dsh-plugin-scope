@@ -12,7 +12,7 @@ retrieval layer must not hide:
 * bounded pagination and neighbour context.
 
 One integration test uses the real frozen corpus when it is present. It is
-skipped when the corpus or the 422-PMID list is unavailable.
+skipped when the corpus or the 405-PMID inclusion list is unavailable.
 """
 from __future__ import annotations
 
@@ -389,7 +389,7 @@ def write_corpus(
         learn / "repair_a.jsonl",
         default_repairs() if repairs is None else repairs,
     )
-    pmid_list = root / "included_pmids_422.txt"
+    pmid_list = root / "included_pmids_405.txt"
     pmid_list.write_text("\n".join(included) + "\n", encoding="utf-8")
     specs = [
         SK.SourceSpec("workflow", research / "workflows.jsonl", "workflows"),
@@ -961,14 +961,14 @@ def test_corpus_fingerprint_is_stable_across_rebuilds(index):
 
 REAL_RESEARCH = ROOT / "research"
 REAL_PMID_LIST = Path(
-    "/data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt"
+    "/data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt"
 )
 
 
 @pytest.mark.skipif(
     not (REAL_RESEARCH / "workflows.jsonl").is_file()
     or not REAL_PMID_LIST.is_file(),
-    reason="real frozen corpus or 422-PMID list unavailable",
+    reason="real frozen corpus or 405-PMID inclusion list unavailable",
 )
 def test_real_frozen_corpus_contract():
     index = SK.ScopeKnowledge(
@@ -976,7 +976,7 @@ def test_real_frozen_corpus_contract():
         pmid_list_path=REAL_PMID_LIST,
     )
     stats = index.build()
-    assert stats["pmid_list"]["n_pmids"] == 422
+    assert stats["pmid_list"]["n_pmids"] == 405
     assert stats["n_hits_indexed"] > 10_000
     assert stats["excluded"]["retracted_records"] >= 1
     assert stats["excluded"]["out_of_scope_records"] > 0

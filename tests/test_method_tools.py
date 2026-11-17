@@ -66,7 +66,7 @@ def payload(methods: list[dict], *, registry_used: bool = True) -> dict:
         "source": {"name": "method_registry.load_registry", "registry_used": registry_used,
                    "n_records": len(methods)},
         "metadata": {
-            "scope": {"pmid_list": "included_pmids_422.txt", "n_papers": 421,
+            "scope": {"pmid_list": "included_pmids_405.txt", "n_papers": 404,
                       "retraction_excluded": ["36450980"]},
             "incomplete": True,
             "corpus_sha256": "deadbeef",
@@ -424,10 +424,10 @@ def test_search_metadata_is_compact_while_stats_keep_the_full_audit(monkeypatch)
     bundle = install(monkeypatch, [AUCell])
     bundle["metadata"]["scope"]["pmids_without_qualifying_records"] = huge
     bundle["metadata"]["stats"] = {
-        "counts": {"n_records_total": 11214, "n_methods_literature": 6012,
-                   "n_methods_total": 6016, "n_adapters": 4},
+        "counts": {"n_records_total": 11214, "n_methods_literature": 3672,
+                   "n_methods_total": 3676, "n_adapters": 4},
         "scope": {"pmids_without_qualifying_records": huge},
-        "pmid_list": {"sha256": "abc", "n_pmids": 422},
+        "pmid_list": {"sha256": "abc", "n_pmids": 405},
         "retractions": [{"pmid": "36450980"}],
     }
 
@@ -571,7 +571,7 @@ def test_registry_native_records_map_ids_corpus_and_support():
             },
         ],
         "stats": {"n_methods": 2},
-        "scope": {"pmid_list": "included_pmids_422.txt", "n_papers": 421,
+        "scope": {"pmid_list": "included_pmids_405.txt", "n_papers": 404,
                   "retraction_excluded": ["36450980"]},
         "incomplete": True,
     }

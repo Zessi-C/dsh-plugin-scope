@@ -20,9 +20,11 @@ What it reads
 
 Hard rules
 ----------
-1. The user's 422-PMID list is authoritative. If the list cannot be read,
-   construction fails closed unless ``allow_missing_pmid_list=True`` is passed
-   explicitly for an audit. Records whose PMID is not in the list are dropped.
+1. The user's 405-PMID inclusion list is authoritative (the current upstream
+   set; ``included_pmids_422.txt`` is a superseded snapshot kept only for
+   reproducing pre-2026-11-13 numbers). If the list cannot be read, construction
+   fails closed unless ``allow_missing_pmid_list=True`` is passed explicitly for
+   an audit. Records whose PMID is not in the list are dropped.
    ``include_out_of_scope=True`` is likewise an audit-only escape hatch; it
    never overrides the retraction rule.
 2. Retracted papers are hard-excluded before any search. PMID 36450980 is in
@@ -62,7 +64,7 @@ Typical use
     from scope_knowledge import ScopeKnowledge
 
     idx = ScopeKnowledge(research_dir="/data/.../research",
-                         pmid_list_path="/data/.../included_pmids_422.txt")
+                         pmid_list_path="/data/.../included_pmids_405.txt")
     page = idx.search("pseudobulk", source_kinds=["method"], limit=20)
     hit = page["hits"][0]
     detail = idx.get(hit["evidence_id"], matched_fields=hit["matched_fields"])
@@ -152,16 +154,48 @@ MAX_WARNINGS = 200
 PMID_LIST_ENV = "SCOPE_INCLUDED_PMIDS"
 DEFAULT_RESEARCH_DIR = Path(__file__).resolve().parent.parent / "research"
 DEFAULT_PMID_LIST_CANDIDATES = (
-    Path("/data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt"),
-    Path("/home/zeiss/data/singlecell-quant/data/included_pmids_422.txt"),
-    Path.home() / "data/singlecell-quant/data/included_pmids_422.txt",
+    # Only the current inclusion set is a default candidate. The superseded 422
+    # list is deliberately not a fallback: a missing current list fails closed
+    # instead of silently falling back to an obsolete scope.
+    Path("/data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt"),
+    Path("/home/zeiss/data/singlecell-quant/data/included_pmids_405.txt"),
+    Path.home() / "data/singlecell-quant/data/included_pmids_405.txt",
 )
 
-# SHA-256 recorded for included_pmids_422.txt on 2026-11-12. A different hash is
-# reported as a warning, not an error: the upstream list may legitimately change.
+# SHA-256 recorded for included_pmids_405.txt on 2026-11-17 (current upstream
+# inclusion set: 422 minus the 17 papers excluded on 2026-11-13). A different
+# hash is reported as a warning, not an error: an explicit custom list is
+# legitimate, and the upstream snapshot may move again.
 KNOWN_PMID_LIST_SHA256 = (
-    "cd7f602bff388be3021cfed2d9c4d0d1fa6f989aaaf9a681d95bfa9cbecf2635"
+    "835beea7c489393e9e92ea17c8e0f69cb4f53a9af0d88e6f89f8b3e01f76fb90"
 )
+
+# Snapshots that have been characterised before. The current hash above is the
+# only one that counts as a match; the older entry is named in stats and in the
+# warning so that passing a superseded list for historical reproduction does not
+# look like an unknown file. An explicit ``pmid_list_path`` / ``SCOPE_INCLUDED_PMIDS``
+# always wins over the defaults; this table never overrides the configured list.
+KNOWN_PMID_LIST_SNAPSHOTS = {
+    KNOWN_PMID_LIST_SHA256: {
+        "label": "included_pmids_405",
+        "n_pmids": 405,
+        "status": "current",
+        "recorded": "2026-11-17",
+        "upstream_rule": "422 minus 17 (2026-11-13 ruling)",
+    },
+    "cd7f602bff388be3021cfed2d9c4d0d1fa6f989aaaf9a681d95bfa9cbecf2635": {
+        "label": "included_pmids_422",
+        "n_pmids": 422,
+        "status": "superseded",
+        "recorded": "2026-11-12",
+        "superseded": "2026-11-13",
+        "superseded_by": "included_pmids_405",
+        "note": (
+            "historical scope; pass it explicitly only to reproduce "
+            "pre-2026-11-13 numbers"
+        ),
+    },
+}
 
 AUTHOR_FOCUS_POLICY = (
     "author_focus_groups records what the authors studied. It is context only and "
@@ -1180,6 +1214,8 @@ class ScopeKnowledge:
                 "sha256": scope.get("sha256"),
                 "n_pmids": scope.get("n_pmids", 0),
                 "scope_mode": scope["mode"],
+                "known_sha256": KNOWN_PMID_LIST_SHA256,
+                "known_snapshot": copy.deepcopy(scope.get("known_snapshot")),
                 "matches_known_snapshot": scope.get("matches_known_snapshot"),
                 "n_malformed_lines": scope.get("n_malformed", 0),
                 "n_duplicates": scope.get("n_duplicates", 0),
@@ -1224,7 +1260,7 @@ class ScopeKnowledge:
                 )
             warn(
                 "pmid_list_missing: retrieval is UNFILTERED; the authoritative "
-                "422-paper scope is not applied"
+                "405-paper inclusion scope is not applied"
             )
             return {
                 "mode": "unfiltered",
@@ -1232,6 +1268,7 @@ class ScopeKnowledge:
                 "sha256": None,
                 "n_pmids": 0,
                 "pmids_set": frozenset(),
+                "known_snapshot": None,
                 "matches_known_snapshot": None,
                 "n_malformed": 0,
                 "n_duplicates": 0,
@@ -1249,10 +1286,20 @@ class ScopeKnowledge:
                 f"expected {self.expected_pmid_list_sha256}, got {sha256} ({path})"
             )
         if sha256 != KNOWN_PMID_LIST_SHA256:
-            warn(
-                "pmid_list_hash_differs_from_known_snapshot: "
-                f"{path} sha256={sha256}"
-            )
+            snapshot = KNOWN_PMID_LIST_SNAPSHOTS.get(sha256)
+            if snapshot is not None and snapshot.get("status") == "superseded":
+                warn(
+                    "pmid_list_is_superseded_snapshot: "
+                    f"{path} sha256={sha256} is {snapshot.get('label')} "
+                    f"(superseded {snapshot.get('superseded')} by "
+                    f"{snapshot.get('superseded_by')}); retrieval follows the "
+                    "configured list, use it only to reproduce historical numbers"
+                )
+            else:
+                warn(
+                    "pmid_list_hash_differs_from_known_snapshot: "
+                    f"{path} sha256={sha256}"
+                )
 
         pmids: list[str] = []
         seen: set[str] = set()
@@ -1282,6 +1329,7 @@ class ScopeKnowledge:
             "sha256": sha256,
             "n_pmids": len(pmids),
             "pmids_set": frozenset(pmids),
+            "known_snapshot": copy.deepcopy(KNOWN_PMID_LIST_SNAPSHOTS.get(sha256)),
             "matches_known_snapshot": sha256 == KNOWN_PMID_LIST_SHA256,
             "n_malformed": malformed,
             "n_duplicates": duplicates,

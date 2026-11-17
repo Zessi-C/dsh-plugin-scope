@@ -3,11 +3,11 @@
 The catalog is a thin, honest adapter over two authorities:
 
 * ``EXECUTABLE`` (this module): the four wired adapters and nothing else;
-* ``method_registry``: the 422-scoped corpus index and the explicit
+* ``method_registry``: the 405-scoped corpus index and the explicit
   adapter-to-instance mapping.
 
 These tests use a fake registry for the contract and, when the real registry is
-installed, one integration check that the 422/retraction filter and the
+installed, one integration check that the 405/retraction filter and the
 AUCell/UCell, inferCNV/CopyKAT distinctions hold on the frozen corpus.
 They do not run the R adapters.
 """
@@ -68,9 +68,9 @@ class FakeRegistry:
             "returned": len(page), "has_more": end < total,
             "next_offset": end if end < total else None,
             "methods": deepcopy(page),
-            "scope": {"n_included_pmids": 422, "n_effective_pmids": 421,
+            "scope": {"n_included_pmids": 405, "n_effective_pmids": 404,
                       "retracted_pmids": ["36450980"]},
-            "corpus": {"sha256": "0" * 64, "n_records_qualifying": 6865},
+            "corpus": {"sha256": "0" * 64, "n_records_qualifying": 6646},
             "incomplete": True,
             "notes": ["extraction is incomplete"],
         }
@@ -79,11 +79,11 @@ class FakeRegistry:
         return {
             "schema": "sctda.method_registry.stats/1",
             "scope": {
-                "pmid_list_path": "/data/included_pmids_422.txt",
+                "pmid_list_path": "/data/included_pmids_405.txt",
                 "pmid_list_sha256": "f" * 64,
                 "pmid_list_matches_known": True,
-                "n_included_pmids": 422,
-                "n_effective_pmids": 421,
+                "n_included_pmids": 405,
+                "n_effective_pmids": 404,
                 "retracted_pmids": ["36450980"],
             },
             "counts": {"n_methods_literature": len(self.methods)},
@@ -159,7 +159,7 @@ def test_every_executable_anchor_resolves_in_frozen_snapshot():
     sys.path.insert(0, str(ROOT / "tools"))
     from brief_index import parse_brief
 
-    list_path = Path("/data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt")
+    list_path = Path("/data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt")
     scope_pmids = ({line.strip() for line in
                     list_path.read_text(encoding="utf-8").splitlines()
                     if line.strip()} if list_path.exists() else set())
@@ -173,7 +173,7 @@ def test_every_executable_anchor_resolves_in_frozen_snapshot():
             assert set(ref) >= {"pmid", "locator", "verbatim", "note"}
             if scope_pmids:
                 assert ref["pmid"] in scope_pmids, (
-                    f"{method_id}: anchor PMID {ref['pmid']} is outside the 422 scope")
+                    f"{method_id}: anchor PMID {ref['pmid']} is outside the 405 scope")
                 assert ref["pmid"] != "36450980", "retracted PMID cannot be an anchor"
             assert ref["locator"] not in seen, f"{method_id}: duplicate locator"
             seen.add(ref["locator"])
@@ -382,7 +382,7 @@ def test_catalog_summary_pages_and_reports_totals(fake):
     assert out["limit"] == catalog.DISCOVERED_PAGE_DEFAULT
     assert out["incomplete"] is True
     assert out["status"] == "ok"
-    assert out["scope"]["n_included_pmids"] == 422
+    assert out["scope"]["n_included_pmids"] == 405
     assert out["scope"]["retracted_pmids"] == ["36450980"]
     assert out["scope"]["pmid_list_sha256"] == "f" * 64
     assert out["scope"]["corpus_sha256"] == "0" * 64
@@ -535,9 +535,9 @@ def test_real_registry_scope_and_exact_adapter_distinctions():
     reg = pytest.importorskip("sctda.method_registry")
     stats = reg.registry_stats()
     scope = stats.get("scope") or {}
-    assert scope.get("n_included_pmids") == 422
+    assert scope.get("n_included_pmids") == 405
     assert "36450980" in (scope.get("retracted_pmids") or [])
-    assert scope.get("n_effective_pmids") == 421
+    assert scope.get("n_effective_pmids") == 404
 
     # Exact-name adapter mapping, not substring matching.
     assert [h["method_id"] for h in reg.registry_adapters_for("UCell")] == []
@@ -581,15 +581,15 @@ def test_real_registry_scope_and_exact_adapter_distinctions():
     assert catalog.literature_backing("composition", detail=True)["found"] is False
 
 
-def test_real_catalog_summary_is_422_scoped_and_does_not_page_unbounded():
+def test_real_catalog_summary_is_405_scoped_and_does_not_page_unbounded():
     pytest.importorskip("sctda.method_registry")
-    list_path = Path("/data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt")
+    list_path = Path("/data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt")
     if not list_path.exists():
-        pytest.skip("422-PMID list unavailable")
+        pytest.skip("405-PMID inclusion list unavailable")
     pmids = {line.strip() for line in
              list_path.read_text(encoding="utf-8").splitlines() if line.strip()}
     if not pmids:
-        pytest.skip("422-PMID list unavailable")
+        pytest.skip("405-PMID inclusion list unavailable")
     out = catalog.catalog_summary()
     assert out["status"] == "ok"
     assert out["n_executable"] == 4
@@ -605,8 +605,8 @@ def test_real_catalog_summary_is_422_scoped_and_does_not_page_unbounded():
     assert all(set(r["pmids"]) <= pmids for r in full)
     assert all("36450980" not in r["pmids"] for r in full)
     scope = out["registry"]["scope"]
-    assert scope.get("n_included_pmids") == 422
-    assert scope.get("n_effective_pmids") == 421
+    assert scope.get("n_included_pmids") == 405
+    assert scope.get("n_effective_pmids") == 404
     assert "36450980" in (scope.get("retracted_pmids") or [])
 
     # RegistryReview payload regression: the listing must not embed every

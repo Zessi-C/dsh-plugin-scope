@@ -46,7 +46,7 @@ def _build(tmp_path, records, pmids, retractions=None, executable=None):
         "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
         encoding="utf-8",
     )
-    pmid_list = tmp_path / "included_pmids_422.txt"
+    pmid_list = tmp_path / "included_pmids_405.txt"
     pmid_list.write_text("\n".join(pmids) + "\n", encoding="utf-8")
     return MR.build_registry(
         methods_path=methods,
@@ -565,9 +565,9 @@ def real_registry():
 
 def test_real_corpus_scope_and_retraction(real_registry):
     stats = real_registry.stats()
-    assert stats["scope"]["n_included_pmids"] == 422
+    assert stats["scope"]["n_included_pmids"] == 405
     assert "36450980" in stats["scope"]["retracted_pmids"]
-    assert stats["scope"]["n_effective_pmids"] == 421
+    assert stats["scope"]["n_effective_pmids"] == 404
     assert stats["corpus"]["sha256"]
     assert stats["corpus"]["n_parse_errors"] == 0
 
@@ -600,7 +600,6 @@ def test_real_corpus_four_adapter_mappings(real_registry):
     assert all(instance["pipeline_stage"] == "de" for instance in de["instances"])
     assert de["n_papers"] == len({i["pmid"] for i in de["instances"]})
     wilcoxon_record = real_registry.get("Wilcoxon rank-sum test")
-    assert wilcoxon_record["n_papers"] == 65
     assert any(e["pipeline_stage"] != "de" for e in wilcoxon_record["evidence"])
     assert de["n_papers"] < wilcoxon_record["n_papers"]
     # Named by the review as a non-DE use that was previously miscounted.

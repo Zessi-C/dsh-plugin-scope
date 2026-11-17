@@ -25,7 +25,7 @@ function harness({ script = {}, config = {}, services = {} } = {}) {
     role: 'all',
     promptPath: 'research/SCOPE_PROMPT.md',
     researchDir: 'research',
-    pmidListPath: '/lists/included_pmids_422.txt',
+    pmidListPath: '/lists/included_pmids_405.txt',
     ...config,
   }
   return { root, run, defineTool, plugin, ctx, config: resolved }

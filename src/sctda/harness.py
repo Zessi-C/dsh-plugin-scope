@@ -607,8 +607,8 @@ TOOLS: dict[str, ToolSpec] = {
         "sctda_catalog", "Methods discovered in the literature, kept separate from methods "
         "that actually have a working adapter. The discovered list is a bounded page: "
         "pass limit/offset, and optionally query or stage, instead of pulling every name. "
-        "The registry already applies the authoritative 422-PMID scope and retraction "
-        "exclusion; this tool does not re-filter it.", False, False,
+        "The registry already applies the authoritative 405-PMID inclusion scope "
+        "and retraction exclusion; this tool does not re-filter it.", False, False,
         lambda a: catalog_summary(
             executable_only=bool(a.get("executable_only")),
             limit=a.get("limit", 50), offset=a.get("offset", 0),
@@ -627,7 +627,7 @@ TOOLS: dict[str, ToolSpec] = {
     # literature_cache, so it does.
     "sctda_method_search": ToolSpec(
         "sctda_method_search",
-        "Search the local method registry (the same 422-PMID scope as the "
+        "Search the local method registry (the same 405-PMID inclusion scope as the "
         "catalog, retraction-excluded) with deterministic paging. Every hit "
         "carries its corpus provenance (PMIDs, locators, examples) and exactly "
         "one support status: executable (an exact wired adapter exists), "

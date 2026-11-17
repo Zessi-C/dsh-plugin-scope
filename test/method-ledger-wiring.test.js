@@ -97,7 +97,7 @@ async function applyWorker({ script = {}, allow = allowlistFromPreset() } = {}) 
     role: 'worker',
     promptPath: 'research/SCOPE_PROMPT.md',
     researchDir: 'research',
-    pmidListPath: '/lists/included_pmids_422.txt',
+    pmidListPath: '/lists/included_pmids_405.txt',
     runtimePromptPath: 'prompts/methods.md',
     workerExtraTools: allow,
     delegation: { enabled: false },

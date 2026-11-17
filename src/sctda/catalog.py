@@ -5,7 +5,7 @@ Three layers are kept deliberately separate, because the design requires it:
   - EXECUTABLE  : the four adapters wired in ``r/adapters.R`` that have actually
                   run. This module is their single authoritative definition.
   - DISCOVERED  : methods extracted from the frozen literature corpus, filtered
-                  to the authoritative 422-PMID scope list with retractions
+                  to the authoritative 405-PMID inclusion list with retractions
                   hard-excluded. A discovered method never implies support.
   - REGISTRY    : ``method_registry`` owns the corpus index and the explicit
                   adapter-to-instance mapping. Catalog delegates to it instead
@@ -23,7 +23,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-# Discovered methods are paged: the full 422-scoped index is several megabytes.
+# Discovered methods are paged: the full 405-scoped index is several megabytes.
 # Callers that need the complete list (report/CSV generation, not tool output)
 # call ``discovered_methods()`` without a limit.
 DISCOVERED_PAGE_DEFAULT = 50
@@ -31,7 +31,7 @@ DISCOVERED_PAGE_MAX = 500
 _REGISTRY_PAGE = 500
 
 SCOPE_NOTE = (
-    "The 422-PMID list is authoritative, retracted PMID 36450980 is hard-excluded, "
+    "The 405-PMID inclusion list is authoritative, retracted PMID 36450980 is hard-excluded, "
     "and only records with in_scope=true and method_class=computational are listed. "
     "Extraction is known to be incomplete: absence here is not evidence that a "
     "method does not exist in the literature."
@@ -318,7 +318,7 @@ def _collect_all(query: str | None = None,
 def discovered_methods(limit: int | None = None, offset: int = 0) -> list[dict]:
     """Aggregate literature method instances by canonical name.
 
-    Sourced from the unified registry, so the 422-PMID scope and the retraction
+    Sourced from the unified registry, so the 405-PMID scope and the retraction
     exclusion are applied once, not re-implemented here. With ``limit=None``
     this pages through the entire registry and is intended for file artifacts;
     tool calls should use :func:`catalog_summary`, whose default is bounded.
@@ -648,7 +648,7 @@ def catalog_summary(executable_only: bool = False,
             "notes": deepcopy(page.get("notes") or []),
         },
         "incomplete": bool(page.get("incomplete", True)),
-        "note": ("discovered = found in the frozen literature corpus and 422-scoped "
+        "note": ("discovered = found in the frozen literature corpus and 405-scoped "
                  "(may be unsupported); executable = has a wired adapter. The two "
                  "layers are never merged. The discovered list is paged; use "
                  "limit/offset for more, and each row's id/registry_id addresses the "
@@ -660,7 +660,7 @@ def catalog_summary(executable_only: bool = False,
 
 
 def discovered_instances(limit: int | None = None, offset: int = 0) -> list[dict]:
-    """Raw 422-scoped method instances (not aggregated).
+    """Raw 405-scoped method instances (not aggregated).
 
     Uses the registry's evidence view. If the registry exposes only example
     records, this is a partial view, not a claim of completeness.

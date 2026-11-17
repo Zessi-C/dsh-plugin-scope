@@ -16,7 +16,7 @@ const CONFIG = {
   knowledgeTimeoutMs: 5000,
   srcRoot: '/kernel/src',
   researchDir: '/kernel/research',
-  pmidListPath: '/lists/included_pmids_422.txt',
+  pmidListPath: '/lists/included_pmids_405.txt',
   preferRepairs: true,
   bridgePath: BRIDGE,
 }
@@ -32,7 +32,7 @@ test('buildKnowledgeRequest carries the corpus scope and refuses unknown operati
   assert.equal(request.src_root, '/kernel/src')
   assert.deepEqual(request.config, {
     research_dir: '/kernel/research',
-    pmid_list_path: '/lists/included_pmids_422.txt',
+    pmid_list_path: '/lists/included_pmids_405.txt',
     prefer_repairs: true,
   })
   assert.deepEqual(KNOWLEDGE_OPERATIONS, ['search', 'get', 'context', 'record', 'stats'])
