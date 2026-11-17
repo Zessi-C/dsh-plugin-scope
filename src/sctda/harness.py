@@ -391,7 +391,8 @@ def _source_list(args: dict) -> dict:
 def _code_sources(args: dict) -> dict:
     return _source_module_answer("sctda_code_sources", lambda mod: mod.code_sources(
         args["pmid"], page=args.get("page", 1),
-        page_size=args.get("page_size", 20), path=args.get("path")))
+        page_size=args.get("page_size", 20), path=args.get("path"),
+        pmid_list_path=args.get("pmid_list_path")))
 
 
 def _import(args: dict) -> dict:
@@ -917,15 +918,21 @@ TOOLS: dict[str, ToolSpec] = {
         "sctda_code_sources",
         "List the frozen author-code records for one PMID from "
         "research/code_sources.jsonl, paged, with the file SHA-256. Read-only "
-        "and project-free. Every record carries verified=false and "
-        "verification=unchecked (or recorded_check): a repository or script "
-        "link is a lead, not a confirmed implementation or parameter source.",
+        "and project-free. Only PMIDs in the method registry's configured "
+        "inclusion list are served: an out-of-scope PMID answers out_of_scope "
+        "without reading the corpus, and an unreadable list answers failed "
+        "rather than returning an unfiltered answer. Every record carries "
+        "verified=false and verification=unchecked (or recorded_check): a "
+        "repository or script link is a lead, not a confirmed implementation "
+        "or parameter source.",
         False, False, _code_sources,
         {"pmid": {"type": "string", "required": True},
          "page": {"type": "integer", "description": ">= 1; default 1."},
          "page_size": {"type": "integer", "description": "1..100; default 20."},
          "path": {"type": "string",
-                  "description": "Omit; only the checkout's frozen research/code_sources.jsonl is readable. Any other path answers failed."}},
+                  "description": "Omit; only the checkout's frozen research/code_sources.jsonl is readable. Any other path answers failed."},
+         "pmid_list_path": {"type": "string",
+                            "description": "Omit to use the same configured list as sctda_method_* (SCOPE_INCLUDED_PMIDS, else the default included_pmids_405.txt). Pass an explicit list only to reproduce a historical scope, e.g. included_pmids_422.txt; the answer marks it superseded."}},
         roles=("worker", "lead")),
 
     "sctda_import": ToolSpec(

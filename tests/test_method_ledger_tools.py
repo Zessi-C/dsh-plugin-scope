@@ -15,10 +15,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from sctda.harness import TOOLS, invoke_tool, tool_manifest  # noqa: E402
+from sctda.method_registry import read_pmid_list  # noqa: E402
 from sctda.project import Project  # noqa: E402
 
 
@@ -264,8 +267,18 @@ def test_source_read_never_invents_text_for_an_unknown_snapshot(tmp_path):
 
 
 def test_code_sources_reads_the_frozen_file_and_marks_records_unverified():
-    out = invoke_tool("sctda_code_sources", {"pmid": "32997960", "page_size": 5})
+    try:
+        scope = read_pmid_list(None)
+    except (FileNotFoundError, ValueError) as exc:
+        pytest.skip(str(exc))
+    if "32997960" not in scope["pmid_set"]:
+        pytest.skip("the configured inclusion list does not contain 32997960")
+    out = invoke_tool("sctda_code_sources", {
+        "pmid": "32997960", "page_size": 5, "pmid_list_path": scope["path"],
+    })
     assert out["status"] in ("ok", "not_found"), out
+    assert out["pmid_in_scope"] is True
+    assert out["scope"]["n_included_pmids"] >= 1
     assert out["claims_verified"] is False
     if out["status"] == "ok":
         assert out["file_sha256"]

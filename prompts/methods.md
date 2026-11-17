@@ -31,7 +31,7 @@
 - 语料外文献：`sctda_method_external_search`（PubMed / Europe PMC；`scope`、`include_abstracts`、`single_cell_filter` 控制范围），按 `page` / `page_size` 分页；保留返回的 `endpoint`、请求时间与 `sha256`（或缓存路径）。命中标 `external_only`、`usable_as_evidence=false`：只能当线索，不计入清单分母，也不算支持证据。
 - 全文核对：`sctda_lit_fulltext(pmcid=...)` 抓开放获取全文为不可变快照；`not_available` 表示没有 OA 全文，不是空论文。用 `sctda_source_read` 分页读，`sctda_source_verify` 重算哈希；引用时写清 section/locator。
 - 工具官方文档与作者代码：`sctda_source_fetch(url=..., kind="tool_doc"|"author_code")`。只允许 https、固定官方/代码托管域名、拒绝重定向、DNS 必须是公网地址、有字节上限。`blocked` / `too_large` / `unreachable` 是明确答案，不是空结果。
-- 作者代码线索：`sctda_code_sources(pmid=...)` 读冻结的 code_sources 记录；每条都带 `verified=false` / `verification=unchecked`，仓库链接只是线索，不等于参数已核实。
+- 作者代码线索：`sctda_code_sources(pmid=...)` 读冻结的 code_sources 记录；每条都带 `verified=false` / `verification=unchecked`，仓库链接只是线索，不等于参数已核实。它只接受纳入清单内的 PMID：范围外返回 `out_of_scope`，清单不可读返回 `failed`；这两种答案都不表示作者没有代码。
 - 所有快照都要读一遍再用：`sctda_source_read(snapshot_id=...)` 分页读文本（返回 `sha256_verified`），`sctda_source_verify(snapshot_id=...)` 只核对 `sha256` 与字节数（返回 `integrity_verified`、`sha256_match`、`size_match`）；重抓前先用 `sctda_source_list` 看已有快照，避免重复抓同一页。**`integrity_verified=true` / `sha256_verified=true` 只证明文件完整，不证明内容支持你的结论**，也不能写成 claim verified；`claims_verified` 恒为 false。`integrity_failed` 时不要引用该快照，重新抓取或报告缺口。抓取失败只有 `attempt_id`、没有可读的 `snapshot_id`，不要把 attempt id 当快照。
 
 ## 第三步：登记方法与来源（真实写操作）

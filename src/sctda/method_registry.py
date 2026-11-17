@@ -50,6 +50,8 @@ Public API
     load_registry(include_evidence=False) -> dict
     build_registry(methods_path=None, pmid_list_path=None,
                    retractions=None, executable=None) -> MethodRegistry
+    resolve_pmid_list(pmid_list_path=None) -> Path
+    read_pmid_list(pmid_list_path=None) -> dict
 """
 from __future__ import annotations
 
@@ -272,7 +274,14 @@ def _read_jsonl(path: Path) -> tuple[list[dict], int, int]:
     return records, len(lines), errors
 
 
-def _resolve_pmid_list(pmid_list_path: str | os.PathLike | None) -> Path:
+def resolve_pmid_list(pmid_list_path: str | os.PathLike | None = None) -> Path:
+    """Resolve the authoritative PMID inclusion list to a readable file.
+
+    Order: an explicit ``pmid_list_path``, then ``SCOPE_INCLUDED_PMIDS``, then
+    the current inclusion-set defaults. A superseded snapshot is never a
+    fallback: a missing or unreadable configuration raises
+    ``FileNotFoundError`` instead of answering from an obsolete scope.
+    """
     if pmid_list_path is not None:
         path = Path(pmid_list_path)
         if not path.is_file():
@@ -298,6 +307,64 @@ def _resolve_pmid_list(pmid_list_path: str | os.PathLike | None) -> Path:
         f"{PMID_LIST_ENV} or pass pmid_list_path. Tried: "
         + ", ".join(str(c) for c in DEFAULT_PMID_LIST_CANDIDATES)
     )
+
+
+def read_pmid_list(
+    pmid_list_path: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """Read the configured PMID list with the registry's exact rules.
+
+    This is the shared scope source for ``MethodRegistry`` and
+    ``method_sources.code_sources``: ordered, de-duplicated numeric PMIDs,
+    ``#``/blank lines ignored, and a non-numeric line raising ``ValueError``,
+    plus the file SHA-256 and its known-snapshot classification. Callers must
+    treat a raised error as a hard failure, never as permission to answer
+    without scope. An empty file is returned as zero PMIDs (the registry then
+    excludes every record); ``code_sources`` rejects it explicitly instead of
+    answering ``out_of_scope`` for every paper.
+    """
+    path = resolve_pmid_list(pmid_list_path)
+    raw = path.read_bytes()
+    sha = _sha256(raw)
+    included: list[str] = []
+    seen: set[str] = set()
+    duplicate_pmids: list[str] = []
+    for line_number, line in enumerate(
+        raw.decode("utf-8", errors="replace").splitlines(), 1
+    ):
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        if not value.isdigit():
+            # Deliberately no line text: this helper is also reachable with a
+            # caller-supplied path, and an error must not echo file contents.
+            raise ValueError(
+                f"{path}:{line_number}: non-numeric PMID line"
+            )
+        if value in seen:
+            duplicate_pmids.append(value)
+            continue
+        seen.add(value)
+        included.append(value)
+
+    from scope_knowledge import KNOWN_PMID_LIST_SHA256, KNOWN_PMID_LIST_SNAPSHOTS
+
+    known_snapshot = KNOWN_PMID_LIST_SNAPSHOTS.get(sha)
+    return {
+        "path": str(path),
+        "sha256": sha,
+        "sha256_16": sha[:16],
+        "known_sha256": KNOWN_PMID_LIST_SHA256,
+        "known_snapshot": (
+            dict(known_snapshot) if known_snapshot is not None else None
+        ),
+        "matches_known_snapshot": sha == KNOWN_PMID_LIST_SHA256,
+        "pmids": included,
+        "pmid_set": frozenset(included),
+        "n_pmids": len(included),
+        "n_duplicates": len(duplicate_pmids),
+        "duplicate_pmids": duplicate_pmids,
+    }
 
 
 def _retraction_registry(extra: Iterable[Any] | None):
@@ -337,7 +404,7 @@ class MethodRegistry:
         self.methods_path = Path(methods_path) if methods_path is not None else METHODS_PATH
         if not self.methods_path.is_file():
             raise FileNotFoundError(f"methods corpus not found: {self.methods_path}")
-        self.pmid_list_path = _resolve_pmid_list(pmid_list_path)
+        self.pmid_list_path = resolve_pmid_list(pmid_list_path)
         self._executable_override = dict(executable) if executable is not None else None
         self._retractions = _retraction_registry(retractions)
         self._lock = threading.Lock()
@@ -361,25 +428,9 @@ class MethodRegistry:
         corpus_sha = _sha256(raw)
         records, n_lines, parse_errors = _read_jsonl(self.methods_path)
 
-        list_raw = self.pmid_list_path.read_bytes()
-        list_sha = _sha256(list_raw)
-        included: list[str] = []
-        seen: set[str] = set()
-        duplicate_pmids: list[str] = []
-        for line in list_raw.decode("utf-8", errors="replace").splitlines():
-            value = line.strip()
-            if not value or value.startswith("#"):
-                continue
-            if not value.isdigit():
-                raise ValueError(
-                    f"{self.pmid_list_path}: non-numeric PMID line {value!r}"
-                )
-            if value in seen:
-                duplicate_pmids.append(value)
-                continue
-            seen.add(value)
-            included.append(value)
-        included_set = set(included)
+        scope_list = read_pmid_list(self.pmid_list_path)
+        list_sha = scope_list["sha256"]
+        included_set = scope_list["pmid_set"]
 
         retracted = set(self._retractions.pmids)
         effective = included_set - retracted
@@ -641,21 +692,18 @@ class MethodRegistry:
             "n_records_qualifying": n_qualifying,
         }
 
-        from scope_knowledge import KNOWN_PMID_LIST_SHA256, KNOWN_PMID_LIST_SNAPSHOTS
-
-        list_matches_known = list_sha == KNOWN_PMID_LIST_SHA256
-        known_snapshot = KNOWN_PMID_LIST_SNAPSHOTS.get(list_sha)
         self._scope = {
-            "pmid_list_path": str(self.pmid_list_path),
+            "pmid_list_path": scope_list["path"],
             "pmid_list_sha256": list_sha,
-            "pmid_list_sha256_16": list_sha[:16],
-            "pmid_list_known_sha256": KNOWN_PMID_LIST_SHA256,
+            "pmid_list_sha256_16": scope_list["sha256_16"],
+            "pmid_list_known_sha256": scope_list["known_sha256"],
             "pmid_list_known_snapshot": (
-                dict(known_snapshot) if known_snapshot is not None else None
+                dict(scope_list["known_snapshot"])
+                if scope_list["known_snapshot"] is not None else None
             ),
-            "pmid_list_matches_known": list_matches_known,
-            "n_included_pmids": len(included),
-            "n_duplicate_pmids": len(duplicate_pmids),
+            "pmid_list_matches_known": scope_list["matches_known_snapshot"],
+            "n_included_pmids": scope_list["n_pmids"],
+            "n_duplicate_pmids": scope_list["n_duplicates"],
             "retracted_pmids": sorted(retracted, key=_pmid_sort_key),
             "n_retracted_pmids": len(retracted),
             "n_retracted_in_included_list": len(retracted & included_set),
@@ -714,7 +762,8 @@ class MethodRegistry:
             "rerunnable_role=upstream_background is preserved as a record flag "
             "and count, not used to filter methods out.",
         ]
-        if not list_matches_known:
+        if not scope_list["matches_known_snapshot"]:
+            known_snapshot = scope_list["known_snapshot"]
             if known_snapshot is not None and known_snapshot.get("status") == "superseded":
                 self._notes.append(
                     f"included PMID list is the {known_snapshot.get('label')} "
@@ -729,9 +778,10 @@ class MethodRegistry:
                     "the configured list is authoritative and the registry scope "
                     "follows it."
                 )
-        if duplicate_pmids:
+        if scope_list["n_duplicates"]:
             self._notes.append(
-                f"included PMID list contained {len(duplicate_pmids)} duplicate line(s)."
+                "included PMID list contained "
+                f"{scope_list['n_duplicates']} duplicate line(s)."
             )
 
     # --------------------------------------------------------------- adapters

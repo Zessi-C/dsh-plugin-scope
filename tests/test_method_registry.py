@@ -104,6 +104,30 @@ def test_scope_filter_retraction_and_exclusion_accounting(tmp_path):
     assert not ({"222", "999"} & all_pmids)
 
 
+def test_read_pmid_list_shares_scope_rules_and_reports_snapshot_metadata(tmp_path):
+    path = tmp_path / "included_pmids_405.txt"
+    path.write_text("# comment\n\n111\n222\n111\n", encoding="utf-8")
+    parsed = MR.read_pmid_list(path)
+    assert parsed["pmids"] == ["111", "222"]
+    assert parsed["pmid_set"] == frozenset({"111", "222"})
+    assert parsed["n_duplicates"] == 1
+    assert parsed["path"] == str(path)
+    assert parsed["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert parsed["matches_known_snapshot"] is False
+    assert parsed["known_snapshot"] is None
+
+    bad = tmp_path / "bad.txt"
+    bad.write_text("111\nnot-a-pmid\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        MR.read_pmid_list(bad)
+    assert "non-numeric PMID line" in str(excinfo.value)
+    # The error must not echo caller-supplied file content.
+    assert "not-a-pmid" not in str(excinfo.value)
+
+    with pytest.raises(FileNotFoundError):
+        MR.read_pmid_list(tmp_path / "missing.txt")
+
+
 def test_upstream_background_is_preserved_not_filtered(tmp_path):
     records = [
         _record("111", "BackgroundTool", rerunnable_role="upstream_background",

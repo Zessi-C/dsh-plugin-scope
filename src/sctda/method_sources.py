@@ -1070,9 +1070,64 @@ def _code_sources_path(path: str | None) -> Path | None:
     return candidate
 
 
+def _inclusion_scope(pmid_list_path: str | os.PathLike | None) -> dict:
+    """Read the method registry's configured inclusion list.
+
+    Imported lazily so this module stays importable without the registry's
+    corpus, and so ``SCOPE_INCLUDED_PMIDS`` is read on every call (the plugin
+    sets it per kernel invocation). Errors propagate: callers must fail closed.
+    """
+    from .method_registry import read_pmid_list
+
+    return read_pmid_list(pmid_list_path)
+
+
+def _scope_meta(scope: dict) -> dict:
+    """The registry-compatible scope block reported with every answer."""
+    return {
+        "pmid_list_path": scope["path"],
+        "pmid_list_sha256": scope["sha256"],
+        "pmid_list_sha256_16": scope["sha256_16"],
+        "pmid_list_known_sha256": scope["known_sha256"],
+        "pmid_list_known_snapshot": (
+            dict(scope["known_snapshot"])
+            if scope["known_snapshot"] is not None else None
+        ),
+        "pmid_list_matches_known": scope["matches_known_snapshot"],
+        "n_included_pmids": scope["n_pmids"],
+    }
+
+
+def _scope_limitations(scope: dict) -> list[str]:
+    """Warnings for a superseded or unrecognised configured list."""
+    snapshot = scope["known_snapshot"] or {}
+    if snapshot.get("status") == "superseded":
+        return [
+            "the configured PMID list is the superseded "
+            f"{snapshot.get('label')} snapshot (superseded by "
+            f"{snapshot.get('superseded_by')}); results reproduce a historical "
+            "scope, not the current inclusion set",
+        ]
+    if not scope["matches_known_snapshot"]:
+        return [
+            "the configured PMID list does not match the recorded current "
+            f"snapshot sha256 {scope['known_sha256']}",
+        ]
+    return []
+
+
 def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
-                 path: str | None = None) -> dict:
+                 path: str | None = None,
+                 pmid_list_path: str | os.PathLike | None = None) -> dict:
     """Page the frozen ``research/code_sources.jsonl`` by exact PMID.
+
+    The PMID must be in the same configured inclusion list the method registry
+    uses: an explicit ``pmid_list_path``, else ``SCOPE_INCLUDED_PMIDS``, else
+    the current default 405-paper list. An out-of-scope PMID answers
+    ``out_of_scope`` without reading the corpus; an unreadable list answers
+    ``failed`` rather than falling back to an unfiltered answer. Pass
+    ``pmid_list_path`` explicitly only to reproduce a historical scope (e.g.
+    ``included_pmids_422.txt``); the answer then reports it as superseded.
 
     These are extraction records, not verified code. Every returned record is
     marked ``verified: false``/``verification: "unchecked"``; ``checked_utc``
@@ -1099,9 +1154,42 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
                 "error": str(exc), "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
                 "limitations": ["invalid paging arguments; nothing was queried"]}
+    try:
+        scope = _inclusion_scope(pmid_list_path)
+    except (OSError, ValueError) as exc:
+        return {"status": "failed", "pmid": raw, "records": [],
+                "error": f"pmid_list_unavailable: {exc}",
+                "claims_verified": False,
+                "evidence_status": "scope_unavailable",
+                "limitations": ["the authoritative inclusion list could not be "
+                                "read; this tool fails closed instead of "
+                                "answering without scope"]}
+    if scope["n_pmids"] == 0:
+        return {"status": "failed", "pmid": raw, "records": [],
+                "scope": _scope_meta(scope),
+                "error": f"pmid_list_unavailable: {scope['path']}: the "
+                         "included PMID list is empty",
+                "claims_verified": False,
+                "evidence_status": "scope_unavailable",
+                "limitations": ["the configured inclusion list contains no "
+                                "PMID; this tool fails closed instead of "
+                                "treating every paper as out of scope"]}
+    if raw not in scope["pmid_set"]:
+        return {"status": "out_of_scope", "pmid": raw, "records": [],
+                "total_for_pmid": 0, "pmid_in_scope": False,
+                "scope": _scope_meta(scope),
+                "error": "pmid is not in the configured inclusion list",
+                "claims_verified": False,
+                "evidence_status": "scope_rejected",
+                "limitations": [
+                    "the authoritative inclusion list excludes this PMID; the "
+                    "frozen corpus was not read, and this is not a statement "
+                    "about whether author code exists",
+                ] + _scope_limitations(scope)}
     source = _code_sources_path(path)
     if source is None:
         return {"status": "failed", "pmid": raw, "records": [],
+                "pmid_in_scope": True, "scope": _scope_meta(scope),
                 "error": "path must be the frozen research/code_sources.jsonl",
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
@@ -1110,6 +1198,7 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
         rows, file_sha = _load_code_records(source)
     except (OSError, ValueError) as exc:
         return {"status": "failed", "pmid": raw, "records": [],
+                "pmid_in_scope": True, "scope": _scope_meta(scope),
                 "source_file": str(source), "error": str(exc),
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
@@ -1120,11 +1209,13 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
     if not matched:
         return {"status": "not_found", "pmid": raw, "records": [],
                 "total_for_pmid": 0, "total_in_file": len(rows),
+                "pmid_in_scope": True, "scope": _scope_meta(scope),
                 "source_file": str(source), "file_sha256": file_sha,
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
                 "limitations": ["no extraction record for this PMID; that is "
-                                "not proof that no author code exists"]}
+                                "not proof that no author code exists"]
+                + _scope_limitations(scope)}
     start = (page - 1) * page_size
     page_rows = matched[start:start + page_size]
     records = []
@@ -1147,6 +1238,8 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
         "has_more": has_more,
         "next_page": page + 1 if has_more else None,
         "records": records,
+        "pmid_in_scope": True,
+        "scope": _scope_meta(scope),
         "source_file": str(source),
         "file_sha256": file_sha,
         "claims_verified": False,
@@ -1157,5 +1250,5 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
             "verbatim/locator fields point into the paper text, not into code",
             "a url is a lead; use fetch_source to read it and verify_snapshot "
             "to check the stored bytes, which still does not verify claims",
-        ],
+        ] + _scope_limitations(scope),
     }

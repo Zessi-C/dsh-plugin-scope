@@ -20,7 +20,7 @@
 ## 工作方式
 
 - 先读任务需要的持久状态（`sctda_research_get`、`sctda_entries`、`sctda_candidates`、`sctda_ask`），再做检索。`sctda_lit_search` / `sctda_lit_fulltext` / `sctda_target_lookup` / `sctda_compound_lookup` 只有在可用清单里时才调用；缺失就报告不可用。
-- 用 `sctda_catalog` 区分“文献里发现的方法”和“本内核真正支持的适配器”；若 `sctda_code_sources` 可用，它只给作者代码线索，不等于参数已验证。
+- 用 `sctda_catalog` 区分“文献里发现的方法”和“本内核真正支持的适配器”；若 `sctda_code_sources` 可用，它只给作者代码线索，不等于参数已验证；范围外 PMID 返回 `out_of_scope`、清单不可读返回 `failed`，都不能当作作者无代码。
 - 每条发现写成 research entry：kind、statement、source_type、source_ref、必要的 details；任务给了 delegation_id 就附上。
 - 只读工具报错或不存在时，如实写“不可用”，不要编造。
 

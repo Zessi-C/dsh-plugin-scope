@@ -3,8 +3,9 @@
 No test here touches the network. DNS and the single HTTP seam
 (`method_sources._open_url`) are monkeypatched; the paper path is exercised by
 faking `literature.http_get`, which leaves the real JATS parser and rendering in
-play. The only real file read is the frozen `research/code_sources.jsonl`, and
-that file is treated as read-only.
+play. Real reads are limited to the frozen `research/code_sources.jsonl` and the
+configured inclusion list, both treated as read-only; every other fixture is a
+temporary file.
 """
 from __future__ import annotations
 
@@ -19,8 +20,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from sctda import literature as lit  # noqa: E402
+from sctda import method_registry as MR  # noqa: E402
 from sctda import method_sources as ms  # noqa: E402
+from sctda.harness import invoke_tool  # noqa: E402
 from sctda.project import Project  # noqa: E402
+import scope_knowledge as SK  # noqa: E402
 
 PUBLIC_IP = "93.184.216.34"
 
@@ -395,16 +399,30 @@ def write_code_corpus(tmp_path: Path) -> Path:
     return path
 
 
+def write_pmid_list(tmp_path: Path, pmids=("1", "2"),
+                    name: str = "included_pmids_405.txt") -> Path:
+    path = tmp_path / name
+    path.write_text("\n".join(pmids) + "\n", encoding="utf-8")
+    return path
+
+
 def test_code_sources_pages_by_pmid_and_marks_every_record_unverified(
         tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
+    list_path = write_pmid_list(tmp_path, ("1", "2", "999"))
     monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
-    first = ms.code_sources("1", page=1, page_size=1)
+    first = ms.code_sources("1", page=1, page_size=1,
+                            pmid_list_path=list_path)
     assert first["status"] == "ok"
     assert first["total_for_pmid"] == 2
     assert first["total_in_file"] == 3
     assert first["has_more"] is True
     assert first["next_page"] == 2
+    assert first["pmid_in_scope"] is True
+    assert first["scope"]["pmid_list_path"] == str(list_path)
+    assert first["scope"]["n_included_pmids"] == 3
+    assert first["scope"]["pmid_list_sha256"] == hashlib.sha256(
+        list_path.read_bytes()).hexdigest()
     record = first["records"][0]
     assert record["verified"] is False
     assert record["verification"] == "unchecked"
@@ -412,7 +430,8 @@ def test_code_sources_pages_by_pmid_and_marks_every_record_unverified(
     assert first["claims_verified"] is False
     assert first["file_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
-    second = ms.code_sources("1", page=2, page_size=1)
+    second = ms.code_sources("1", page=2, page_size=1,
+                             pmid_list_path=list_path)
     assert second["records"][0]["source_id"] == "1:cs2"
     assert second["records"][0]["verified"] is False
     # checked_utc is extraction bookkeeping, not a verification result.
@@ -421,38 +440,195 @@ def test_code_sources_pages_by_pmid_and_marks_every_record_unverified(
 
 def test_code_sources_absent_pmid_is_explicit_not_found(tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
+    list_path = write_pmid_list(tmp_path, ("1", "999"))
     monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
-    result = ms.code_sources("999")
+    result = ms.code_sources("999", pmid_list_path=list_path)
     assert result["status"] == "not_found"
     assert result["total_for_pmid"] == 0
+    assert result["pmid_in_scope"] is True
     assert "not proof" in result["limitations"][0]
 
 
 def test_code_sources_rejects_bad_pmid_and_arbitrary_path(tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
+    list_path = write_pmid_list(tmp_path, ("1",))
     monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
-    assert ms.code_sources("abc")["status"] == "failed"
-    assert ms.code_sources("1", page=0)["status"] == "failed"
-    assert ms.code_sources("1", page_size=10_000)["status"] == "failed"
+    assert ms.code_sources("abc", pmid_list_path=list_path)["status"] == "failed"
+    assert ms.code_sources("1", page=0,
+                           pmid_list_path=list_path)["status"] == "failed"
+    assert ms.code_sources("1", page_size=10_000,
+                           pmid_list_path=list_path)["status"] == "failed"
     elsewhere = tmp_path / "secret" / "code_sources.jsonl"
     elsewhere.parent.mkdir()
     elsewhere.write_text("{}\n", encoding="utf-8")
-    blocked = ms.code_sources("1", path=str(elsewhere))
+    blocked = ms.code_sources("1", path=str(elsewhere),
+                              pmid_list_path=list_path)
     assert blocked["status"] == "failed"
     assert "frozen research/code_sources.jsonl" in blocked["error"]
+
+
+def test_code_sources_refuses_out_of_scope_pmid_without_reading_corpus(
+        tmp_path, monkeypatch):
+    path = write_code_corpus(tmp_path)
+    list_path = write_pmid_list(tmp_path, ("1",))
+    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    monkeypatch.setattr(
+        ms, "_load_code_records",
+        lambda *a, **k: pytest.fail("out-of-scope must not read the corpus"))
+    # PMID 2 has a real extraction record, but the configured list excludes it.
+    result = ms.code_sources("2", pmid_list_path=list_path)
+    assert result["status"] == "out_of_scope"
+    assert result["records"] == []
+    assert result["total_for_pmid"] == 0
+    assert result["pmid_in_scope"] is False
+    assert "not in the configured inclusion list" in result["error"]
+    assert "total_in_file" not in result
+    assert result["scope"]["n_included_pmids"] == 1
+    assert result["claims_verified"] is False
+
+
+def test_code_sources_fails_closed_when_the_pmid_list_is_missing(
+        tmp_path, monkeypatch):
+    path = write_code_corpus(tmp_path)
+    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    monkeypatch.setattr(
+        ms, "_load_code_records",
+        lambda *a, **k: pytest.fail("no list must mean no corpus read"))
+    missing = tmp_path / "no_such_list.txt"
+    monkeypatch.delenv(SK.PMID_LIST_ENV, raising=False)
+    # The defaults are exercised through the registry resolver, so this test
+    # pins the fail-closed branch instead of whatever exists on this machine.
+    monkeypatch.setattr(SK, "DEFAULT_PMID_LIST_CANDIDATES", (missing,))
+
+    implicit = ms.code_sources("1")
+    assert implicit["status"] == "failed"
+    assert implicit["error"].startswith("pmid_list_unavailable:")
+    assert "not found" in implicit["error"]
+    assert implicit["records"] == []
+    assert "fails closed" in implicit["limitations"][0]
+
+    explicit = ms.code_sources("1", pmid_list_path=str(missing))
+    assert explicit["status"] == "failed"
+    assert explicit["records"] == []
+
+    monkeypatch.setenv(SK.PMID_LIST_ENV, str(missing))
+    env = ms.code_sources("1")
+    assert env["status"] == "failed"
+    assert SK.PMID_LIST_ENV in env["error"]
+    assert env["records"] == []
+
+
+def test_code_sources_reads_env_and_default_configured_list(tmp_path, monkeypatch):
+    path = write_code_corpus(tmp_path)
+    list_path = write_pmid_list(tmp_path, ("1",))
+    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+
+    monkeypatch.setenv(SK.PMID_LIST_ENV, str(list_path))
+    assert ms.code_sources("1")["status"] == "ok"
+
+    monkeypatch.delenv(SK.PMID_LIST_ENV, raising=False)
+    monkeypatch.setattr(SK, "DEFAULT_PMID_LIST_CANDIDATES", (list_path,))
+    assert ms.code_sources("1")["status"] == "ok"
+
+
+def test_code_sources_rejects_malformed_or_empty_pmid_lists(tmp_path, monkeypatch):
+    path = write_code_corpus(tmp_path)
+    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    bad = tmp_path / "bad_list.txt"
+    bad.write_text("1\nnot-a-pmid\n", encoding="utf-8")
+    malformed = ms.code_sources("1", pmid_list_path=bad)
+    assert malformed["status"] == "failed"
+    assert "non-numeric PMID line" in malformed["error"]
+    assert malformed["records"] == []
+
+    empty = tmp_path / "empty_list.txt"
+    empty.write_text("# no PMIDs\n\n", encoding="utf-8")
+    blank = ms.code_sources("1", pmid_list_path=empty)
+    assert blank["status"] == "failed"
+    assert "empty" in blank["error"]
+
+
+def test_code_sources_explicit_historical_list_is_marked_superseded(
+        tmp_path, monkeypatch):
+    path = write_code_corpus(tmp_path)
+    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    current = write_pmid_list(tmp_path, ("1", "2"))
+    historical = write_pmid_list(tmp_path, ("1",),
+                                 name="included_pmids_422.txt")
+    current_sha = hashlib.sha256(current.read_bytes()).hexdigest()
+    historical_sha = hashlib.sha256(historical.read_bytes()).hexdigest()
+    monkeypatch.setattr(SK, "KNOWN_PMID_LIST_SHA256", current_sha)
+    monkeypatch.setattr(SK, "KNOWN_PMID_LIST_SNAPSHOTS", {
+        current_sha: {"label": "included_pmids_405", "status": "current"},
+        historical_sha: {
+            "label": "included_pmids_422", "status": "superseded",
+            "superseded": "2026-11-13",
+            "superseded_by": "included_pmids_405",
+        },
+    })
+    result = ms.code_sources("1", pmid_list_path=historical)
+    assert result["status"] == "ok"
+    assert result["scope"]["pmid_list_matches_known"] is False
+    assert result["scope"]["pmid_list_known_snapshot"]["status"] == "superseded"
+    assert any("superseded" in note for note in result["limitations"])
+
+
+def test_code_sources_custom_list_is_used_but_reported_as_unrecognised(
+        tmp_path, monkeypatch):
+    path = write_code_corpus(tmp_path)
+    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    custom = write_pmid_list(tmp_path, ("1",), name="custom_scope.txt")
+    result = ms.code_sources("1", pmid_list_path=custom)
+    assert result["status"] == "ok"
+    assert result["scope"]["pmid_list_matches_known"] is False
+    assert result["scope"]["pmid_list_known_snapshot"] is None
+    assert any("does not match the recorded current snapshot" in note
+               for note in result["limitations"])
 
 
 def test_real_code_sources_corpus_is_readable_without_modification():
     if not ms.CODE_SOURCES_PATH.exists():
         pytest.skip("frozen code_sources.jsonl unavailable")
+    try:
+        scope = MR.read_pmid_list(None)
+    except (FileNotFoundError, ValueError) as exc:
+        pytest.skip(str(exc))
+    if "32997960" not in scope["pmid_set"]:
+        pytest.skip("the configured inclusion list does not contain 32997960")
     before = hashlib.sha256(ms.CODE_SOURCES_PATH.read_bytes()).hexdigest()
-    result = ms.code_sources("32997960", page=1, page_size=5)
+    result = ms.code_sources("32997960", page=1, page_size=5,
+                             pmid_list_path=scope["path"])
     after = hashlib.sha256(ms.CODE_SOURCES_PATH.read_bytes()).hexdigest()
     assert before == after
-    assert result["status"] in ("ok", "not_found")
+    assert result["status"] in ("ok", "not_found"), result
+    assert result["pmid_in_scope"] is True
+    assert result["scope"]["n_included_pmids"] >= 1
     assert result["total_in_file"] > 1000
     if result["status"] == "ok":
         assert all(r["verified"] is False for r in result["records"])
+
+
+
+def test_code_sources_out_of_scope_answer_survives_the_tool_boundary(tmp_path):
+    list_path = tmp_path / "included_pmids_405.txt"
+    list_path.write_text("32997960\n", encoding="utf-8")
+    out = invoke_tool("sctda_code_sources", {
+        "pmid": "1", "pmid_list_path": str(list_path),
+    })
+    assert out["status"] == "out_of_scope", out
+    assert out["records"] == []
+    assert out["pmid_in_scope"] is False
+    assert out["scope"]["pmid_list_path"] == str(list_path)
+
+
+def test_code_sources_missing_list_fails_closed_at_the_tool_boundary(tmp_path):
+    out = invoke_tool("sctda_code_sources", {
+        "pmid": "32997960",
+        "pmid_list_path": str(tmp_path / "missing.txt"),
+    })
+    assert out["status"] == "failed", out
+    assert out["error"].startswith("pmid_list_unavailable:")
+    assert out["records"] == []
 
 
 def test_fetch_requires_an_initialised_project(tmp_path, monkeypatch):
