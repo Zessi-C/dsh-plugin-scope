@@ -1,0 +1,46 @@
+{
+  "name": "dsh-plugin-scope",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SCOPE: autonomous single-cell target discovery on annotated Seurat objects, wired into dsh through the SCTDA kernel's unified tool boundary.",
+  "type": "module",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "lib/*.js",
+    "lib/tools/*.js",
+    "bridge/scope_knowledge_tool.py",
+    "prompts/*.md",
+    "presets/*.yml",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "single-cell",
+    "scope",
+    "sctda"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  }
+}

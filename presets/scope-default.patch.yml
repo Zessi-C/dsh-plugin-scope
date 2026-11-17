@@ -1,0 +1,11 @@
+# Profile-level overlay: make the SCOPE lead the default preset for new
+# sessions without changing the deployment `default` (so a missing SCOPE
+# definition stays visible instead of silently composing something else).
+#
+# Apply to a profile:
+#   dsh --profile web --patch harness/dsh-plugin-scope/presets/scope-default.patch.yml --dump-config
+# or merge the row into that profile's own cordis.patch.yml.
+- id: agent-preset-registry
+  config:
+    default: standard
+    selectedDefault: scope-lead

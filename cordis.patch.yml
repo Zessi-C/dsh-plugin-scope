@@ -1,0 +1,537 @@
+# SCOPE: lead + on-demand specialist presets for dsh.
+#
+# This bundle inserts an `@deepseek-ai/dsh-agent-preset` definition per role.
+# Every preset composes `dsh-plugin-scope` with a different role and, for
+# workers, a different explicit kernel-tool allowlist:
+#
+#   scope-lead        — no bash, read-only fs, native `subagent` tool, kernel
+#                       tools for role=lead, delegation events recorded to db.
+#   scope-worker      — generic read-only task.
+#   scope-literature  — corpus, literature and external-evidence tasks.
+#   scope-data        — candidates, design, task/artifact checks.
+#   scope-methods     — method catalog, code sources, methodological critique.
+#
+# The lead selects a role per task through `agent_preset`; allowedAgentPresets
+# is the closed set. Nothing starts a team or workflow, and no role is a
+# mandatory round.
+#
+# Selecting the preset for new sessions is a deployment choice, not part of this
+# bundle: apply `presets/scope-default.patch.yml` (or set
+# `agent-preset-registry.selectedDefault` in the profile patch) when this
+# profile should default to the SCOPE lead.
+- insert:
+    - id: preset-scope-lead
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: scope-lead
+        name: SCOPE Lead
+        description: Research lead for annotated Seurat objects. Delegates scoped work to on-demand specialist subagents, records research state in project.db, and drives the SCTDA kernel.
+        order: 10
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are the SCOPE research lead powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          # Read-only model surface: no write/edit/patch tool is registered at
+          # all, so the input object cannot be modified through file tools.
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # The native delegation tool. It calls ctx.subagents.startActivation
+          # with provider=spawn; the child is composed from the selected SCOPE
+          # worker preset. The model may not select any other preset, and depth
+          # is capped at 1. No team/workflow member is composed.
+          - id: delegation
+            name: cordis:group
+            group: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  agentPreset: scope-worker
+                  allowedAgentPresets:
+                    - scope-worker
+                    - scope-literature
+                    - scope-data
+                    - scope-methods
+                  maxDepth: 1
+                  modelSelection: false
+                  modelDiscovery: false
+          - id: scope
+            name: dsh-plugin-scope
+            config:
+              kernelRoot: /data/disk1/zeiss/llm-agent
+              python: python3
+              project: ''
+              role: lead
+              runtimePromptPath: ''
+              promptSectionName: scope:runtime-policy
+              promptOrder: 12000
+              # The long draft is optional extra material; a missing file is
+              # reported as absent, not a load failure.
+              promptPath: research/SCOPE_PROMPT.md
+              extendedPromptSectionName: scope:extended-scientific-draft
+              extendedPromptOrder: 12050
+              researchDir: research
+              pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt
+              preferRepairs: true
+              kernelTimeoutMs: 600000
+              knowledgeTimeoutMs: 120000
+              manifestTimeoutMs: 60000
+              maxPageSize: 200
+              delegation:
+                enabled: null
+                toolName: subagent
+                provider: spawn
+                workerPreset: scope-worker
+                allowedPresets:
+                  - scope-worker
+                  - scope-literature
+                  - scope-data
+                  - scope-methods
+                maxDepth: 1
+                project: ''
+                leaseSeconds: 900
+                heartbeatSeconds: 180
+                settleGraceSeconds: 90
+
+    - id: preset-scope-worker
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: scope-worker
+        name: SCOPE Worker
+        description: One scoped read-only task. Kernel allowlist plus the research-entry channel; no shell, no delegation, no plan or run authority.
+        order: 20
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a SCOPE analysis worker powered by the {{model}} model. Complete the single delegated task; do not delegate further.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # No delegation group and no bash row.
+          - id: scope
+            name: dsh-plugin-scope
+            config:
+              kernelRoot: /data/disk1/zeiss/llm-agent
+              python: python3
+              project: ''
+              role: worker
+              runtimePromptPath: ''
+              promptSectionName: scope:runtime-policy
+              promptOrder: 12000
+              promptPath: research/SCOPE_PROMPT.md
+              extendedPromptSectionName: scope:extended-scientific-draft
+              extendedPromptOrder: 12050
+              researchDir: research
+              pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt
+              preferRepairs: true
+              kernelTimeoutMs: 600000
+              knowledgeTimeoutMs: 120000
+              manifestTimeoutMs: 60000
+              maxPageSize: 200
+              workerExtraTools:
+                - sctda_status
+                - sctda_candidates
+                - sctda_ask
+                - sctda_catalog
+                - sctda_dossiers
+                - sctda_check_freeze
+                - sctda_research_get
+                - sctda_research_list
+                - sctda_entry_get
+                - sctda_entries
+                - sctda_entry_add
+                - sctda_tasks
+                - sctda_artifacts
+                - sctda_design
+                - sctda_env
+                - sctda_candidate_synthesis
+                - sctda_code_sources
+                - sctda_method_search
+                - sctda_method_get
+                - sctda_method_stats
+                - sctda_method_external_search
+                - sctda_lit_search
+                - sctda_target_lookup
+                - sctda_compound_lookup
+              delegation:
+                enabled: false
+                toolName: subagent
+                provider: spawn
+                workerPreset: scope-worker
+                maxDepth: 1
+                project: ''
+                leaseSeconds: 900
+                heartbeatSeconds: 180
+                settleGraceSeconds: 90
+
+    - id: preset-scope-literature
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: scope-literature
+        name: SCOPE Literature Worker
+        description: One scoped literature or external-evidence task. Corpus, citation and immutable source-snapshot tools (fetch, read, verify) plus the research-entry channel; no shell, no delegation, no analysis execution.
+        order: 30
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a SCOPE literature and evidence worker powered by the {{model}} model. Complete the single delegated task; do not delegate further.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: scope
+            name: dsh-plugin-scope
+            config:
+              kernelRoot: /data/disk1/zeiss/llm-agent
+              python: python3
+              project: ''
+              role: worker
+              runtimePromptPath: prompts/literature.md
+              promptSectionName: scope:runtime-policy
+              promptOrder: 12000
+              promptPath: research/SCOPE_PROMPT.md
+              extendedPromptSectionName: scope:extended-scientific-draft
+              extendedPromptOrder: 12050
+              researchDir: research
+              pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt
+              preferRepairs: true
+              kernelTimeoutMs: 600000
+              knowledgeTimeoutMs: 120000
+              manifestTimeoutMs: 60000
+              maxPageSize: 200
+              workerExtraTools:
+                - sctda_status
+                - sctda_candidates
+                - sctda_ask
+                - sctda_catalog
+                - sctda_code_sources
+                - sctda_research_get
+                - sctda_research_list
+                - sctda_entry_get
+                - sctda_entries
+                - sctda_entry_add
+                - sctda_lit_search
+                - sctda_lit_fulltext
+                - sctda_source_read
+                - sctda_source_verify
+                - sctda_source_list
+                - sctda_target_lookup
+                - sctda_compound_lookup
+              delegation:
+                enabled: false
+                toolName: subagent
+                provider: spawn
+                workerPreset: scope-literature
+                maxDepth: 1
+                project: ''
+                leaseSeconds: 900
+                heartbeatSeconds: 180
+                settleGraceSeconds: 90
+
+    - id: preset-scope-data
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: scope-data
+        name: SCOPE Data Worker
+        description: One scoped candidate, design, task or artifact check. Read-only kernel tools plus the research-entry channel; no shell, no delegation.
+        order: 40
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a SCOPE data and artifact worker powered by the {{model}} model. Complete the single delegated task; do not delegate further.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: scope
+            name: dsh-plugin-scope
+            config:
+              kernelRoot: /data/disk1/zeiss/llm-agent
+              python: python3
+              project: ''
+              role: worker
+              runtimePromptPath: prompts/data.md
+              promptSectionName: scope:runtime-policy
+              promptOrder: 12000
+              promptPath: research/SCOPE_PROMPT.md
+              extendedPromptSectionName: scope:extended-scientific-draft
+              extendedPromptOrder: 12050
+              researchDir: research
+              pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt
+              preferRepairs: true
+              kernelTimeoutMs: 600000
+              knowledgeTimeoutMs: 120000
+              manifestTimeoutMs: 60000
+              maxPageSize: 200
+              workerExtraTools:
+                - sctda_status
+                - sctda_candidates
+                - sctda_ask
+                - sctda_dossiers
+                - sctda_check_freeze
+                - sctda_research_get
+                - sctda_research_list
+                - sctda_entry_get
+                - sctda_entries
+                - sctda_entry_add
+                - sctda_tasks
+                - sctda_artifacts
+                - sctda_design
+                - sctda_env
+                - sctda_candidate_synthesis
+              delegation:
+                enabled: false
+                toolName: subagent
+                provider: spawn
+                workerPreset: scope-data
+                maxDepth: 1
+                project: ''
+                leaseSeconds: 900
+                heartbeatSeconds: 180
+                settleGraceSeconds: 90
+
+    - id: preset-scope-methods
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: scope-methods
+        name: SCOPE Methods Worker
+        description: One scoped method or assumption check. Paged unified method registry, corpus-external method lookup, adapter catalog, project method ledger (records into an initialised project only), immutable source snapshots with read/verify, code sources and literature tools plus the research-entry channel; no shell, no delegation, no analysis execution.
+        order: 50
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a SCOPE methods and assumptions worker powered by the {{model}} model. Complete the single delegated task; do not delegate further.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: scope
+            name: dsh-plugin-scope
+            config:
+              kernelRoot: /data/disk1/zeiss/llm-agent
+              python: python3
+              project: ''
+              role: worker
+              runtimePromptPath: prompts/methods.md
+              promptSectionName: scope:runtime-policy
+              promptOrder: 12000
+              promptPath: research/SCOPE_PROMPT.md
+              extendedPromptSectionName: scope:extended-scientific-draft
+              extendedPromptOrder: 12050
+              researchDir: research
+              pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_422.txt
+              preferRepairs: true
+              kernelTimeoutMs: 600000
+              knowledgeTimeoutMs: 120000
+              manifestTimeoutMs: 60000
+              maxPageSize: 200
+              workerExtraTools:
+                - sctda_status
+                - sctda_catalog
+                - sctda_code_sources
+                - sctda_method_search
+                - sctda_method_get
+                - sctda_method_stats
+                - sctda_method_external_search
+                # Project method ledger: three real writes (register, alias,
+                # source) plus its read surface. Every write requires an
+                # already-initialised project; none can create one.
+                - sctda_method_ledger_register
+                - sctda_method_ledger_alias_add
+                - sctda_method_ledger_source_add
+                - sctda_method_ledger_list
+                - sctda_method_ledger_get
+                - sctda_method_ledger_sources
+                # Immutable source snapshots: fetch (write) then read and
+                # re-hash. A fetch is not a check and a hash is not support.
+                - sctda_source_fetch
+                - sctda_lit_fulltext
+                - sctda_source_read
+                - sctda_source_verify
+                - sctda_source_list
+                - sctda_ask
+                - sctda_research_get
+                - sctda_research_list
+                - sctda_entry_get
+                - sctda_entries
+                - sctda_entry_add
+                - sctda_lit_search
+              delegation:
+                enabled: false
+                toolName: subagent
+                provider: spawn
+                workerPreset: scope-methods
+                maxDepth: 1
+                project: ''
+                leaseSeconds: 900
+                heartbeatSeconds: 180
+                settleGraceSeconds: 90
