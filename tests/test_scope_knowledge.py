@@ -25,8 +25,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 import scope_knowledge as SK  # noqa: E402
+import build_corpus as BC  # noqa: E402
 
 PMID = "11111111"
 SHARD_ONLY = "33333333"
@@ -39,11 +41,22 @@ RETRACTED = "36450980"
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not records:
+        path.write_text("", encoding="utf-8")
+        return
     path.write_text(
         "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
         + "\n",
         encoding="utf-8",
     )
+
+
+def drop_last_record(path: Path) -> None:
+    """Rewrite a JSONL file without its final record, leaving the manifest stale."""
+    lines = [
+        line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
 
 
 def default_workflows() -> list[dict]:
@@ -173,6 +186,48 @@ def default_workflows() -> list[dict]:
             "author_focus_groups": [],
             "no_prior_warning": "",
         },
+        {
+            # No pmid and no record id: a raw mention of the retracted PMID.
+            # The build requires an attributed pmid on pattern records, so this
+            # defensive case lives on a verbatim-copied workflow instead.
+            "workflow_id": "unattributed:raw1",
+            "question": {
+                "text": "Raw reference question",
+                "evidence": [
+                    {
+                        "locator": "results:L1:P1:S1",
+                        "verbatim": "RAW_REFERENCE_TOKEN cites PMID 36450980.",
+                    }
+                ],
+            },
+            "comparison": "none",
+            "cell_level": "none",
+            "steps": [],
+            "claims": [],
+            "gaps": [],
+            "author_focus_groups": [],
+            "no_prior_warning": "",
+        },
+        {
+            # No pmid and no retracted reference: cannot be attributed.
+            "workflow_id": "unattributed:wf1",
+            "question": {
+                "text": "Unattributed question",
+                "evidence": [
+                    {
+                        "locator": "results:L1:P1:S1",
+                        "verbatim": "Unattributed quote.",
+                    }
+                ],
+            },
+            "comparison": "none",
+            "cell_level": "none",
+            "steps": [],
+            "claims": [],
+            "gaps": [],
+            "author_focus_groups": [],
+            "no_prior_warning": "",
+        },
     ]
 
 
@@ -203,6 +258,19 @@ def default_methods() -> list[dict]:
     ]
 
 
+def default_code_sources() -> list[dict]:
+    return [
+        {
+            "source_id": f"{PMID}:cs1",
+            "pmid": PMID,
+            "url": "https://github.com/example/repo",
+            "url_kind": "repository",
+            "ownership": "author",
+            "status": "author_repo_from_text",
+        }
+    ]
+
+
 def default_shards() -> list[dict]:
     return [
         {
@@ -219,6 +287,24 @@ def default_shards() -> list[dict]:
                     "source_locator": "results:L2:P1:S1",
                     "verbatim": "The myeloid fraction decreased after treatment.",
                     "prompt_lesson": "old lesson",
+                }
+            ],
+        },
+        {
+            # A shard record for the retracted paper: repair_a supersedes it, and
+            # having both is what the old layout looked like on disk.
+            "pmid": RETRACTED,
+            "status": "reviewed",
+            "question": "Retracted shard question",
+            "patterns": [
+                {
+                    "observation": "RETRACTED_SHARD_TOKEN",
+                    "ask_next": "none",
+                    "rationale_source": "inferred",
+                    "limitations": "none",
+                    "source_locator": "results:L1:P1:S1",
+                    "verbatim": "RETRACTED_SHARD_TOKEN.",
+                    "prompt_lesson": "retracted shard lesson",
                 }
             ],
         },
@@ -272,36 +358,6 @@ def default_shards() -> list[dict]:
                     "verbatim": "CD4+ T cells were enriched.",
                     "prompt_lesson": "lesson four",
                 },
-            ],
-        },
-        {
-            # No pmid and no record id: a raw mention of the retracted PMID.
-            "status": "reviewed",
-            "patterns": [
-                {
-                    "observation": "RAW_REFERENCE_TOKEN cites PMID 36450980",
-                    "ask_next": "none",
-                    "rationale_source": "inferred",
-                    "limitations": "none",
-                    "source_locator": None,
-                    "verbatim": None,
-                    "prompt_lesson": "raw lesson",
-                }
-            ],
-        },
-        {
-            # No pmid and no retracted reference: cannot be attributed.
-            "status": "reviewed",
-            "patterns": [
-                {
-                    "observation": "UNATTRIBUTED_TOKEN",
-                    "ask_next": "none",
-                    "rationale_source": "inferred",
-                    "limitations": "none",
-                    "source_locator": "results:L1:P1:S1",
-                    "verbatim": "Unattributed quote.",
-                    "prompt_lesson": "unattributed lesson",
-                }
             ],
         },
     ]
@@ -370,6 +426,15 @@ def write_corpus(
     repairs: list[dict] | None = None,
     included: tuple[str, ...] = (PMID, RETRACTED, SHARD_ONLY),
 ) -> tuple[Path, list[SK.SourceSpec], Path]:
+    """Write extraction inputs, then build the corpus the reader actually reads.
+
+    The split layout (root JSONL files plus ``scope_learn/shard_*``/``repair_*``)
+    is only a *build input*: ``tools/build_corpus.build`` copies the three root
+    files and merges the shard/repair pattern records with the same
+    repair-over-shard precedence the reader used to apply at query time.
+    ``source_files`` is returned explicitly so these tests keep exercising the
+    injection path rather than the shipped corpus.
+    """
     research = root / "research"
     learn = research / "scope_learn"
     learn.mkdir(parents=True, exist_ok=True)
@@ -389,13 +454,21 @@ def write_corpus(
         learn / "repair_a.jsonl",
         default_repairs() if repairs is None else repairs,
     )
+    code_sources = research / "code_sources.jsonl"
+    if not code_sources.exists():
+        write_jsonl(code_sources, default_code_sources())
+
+    corpus = research / "corpus"
+    for name, payload in BC.build(research).items():
+        target = corpus / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+
     pmid_list = root / "included_pmids_405.txt"
     pmid_list.write_text("\n".join(included) + "\n", encoding="utf-8")
     specs = [
-        SK.SourceSpec("workflow", research / "workflows.jsonl", "workflows"),
-        SK.SourceSpec("method", research / "methods.jsonl", "methods"),
-        SK.SourceSpec("pattern", learn / "shard_6.jsonl", "shard_6"),
-        SK.SourceSpec("pattern", learn / "repair_a.jsonl", "repair_a"),
+        SK.SourceSpec(kind, corpus / name, label)
+        for kind, name, label in SK.CORPUS_FILES
     ]
     return research, specs, pmid_list
 
@@ -409,7 +482,6 @@ def make_index(
     repairs: list[dict] | None = None,
     included: tuple[str, ...] = (PMID, RETRACTED, SHARD_ONLY),
     extra_retractions=(),
-    prefer_repairs: bool = True,
 ) -> SK.ScopeKnowledge:
     research, specs, pmid_list = write_corpus(
         root,
@@ -424,7 +496,6 @@ def make_index(
         pmid_list_path=pmid_list,
         source_files=specs,
         extra_retractions=extra_retractions,
-        prefer_repairs=prefer_repairs,
     )
 
 
@@ -894,26 +965,126 @@ def test_full_record_retrieval_is_sanitized_and_navigable(index):
 # ---------------------------------------------------------------- repair rules
 
 
-def test_repair_record_supersedes_older_shard(index):
+def test_built_patterns_apply_repair_over_shard_precedence(index):
+    """The reader no longer selects between shard and repair records.
+
+    ``patterns.jsonl`` holds the merged record for each PMID, so the superseded
+    shard text is absent from the corpus entirely rather than being filtered at
+    query time; ``excluded.superseded_records`` therefore stays 0 while the
+    build-time count (2 here) is reported by the manifest.
+    """
     assert index.search("OLD_SHARD_OBSERVATION", limit=50)["hits"] == []
     assert index.search("NEW_REPAIR_OBSERVATION", limit=50)["hits"]
-    assert index.stats()["excluded"]["superseded_records"] >= 1
+    stats = index.stats()
+    assert stats["excluded"]["superseded_records"] == 0
+    assert stats["corpus_manifest"]["patterns"]["superseded_records"] == 2
+    assert stats["corpus_manifest"]["patterns"]["precedence"] == "repair_over_shard"
 
     # A shard record without a repair counterpart remains available.
     assert index.search("SHARD_ONLY_OBSERVATION", limit=50)["hits"]
 
+    # One record per PMID: the merged file is exactly the deduplicated set.
+    patterns = [
+        source for source in stats["sources"] if source["kind"] == "pattern"
+    ]
+    assert [source["label"] for source in patterns] == ["patterns"]
+    assert patterns[0]["n_records"] == 3
 
-def test_repair_precedence_can_be_disabled(tmp_path):
-    index = make_index(tmp_path / "both", prefer_repairs=False)
-    assert index.search("OLD_SHARD_OBSERVATION", limit=50)["hits"]
+
+def test_only_one_pattern_record_per_pmid_is_indexed(index):
+    slugs = [
+        record["record_id"]
+        for record in index.record(SHARD_ONLY, source_kind="pattern")["records"]
+    ]
+    assert len(slugs) == 1
 
 
 # ------------------------------------------------------------- corpus integrity
 
 
+def test_manifest_hash_mismatch_is_reported_not_hidden(tmp_path):
+    research, specs, pmid_list = write_corpus(tmp_path)
+    drop_last_record(research / "corpus" / "patterns.jsonl")
+
+    index = SK.ScopeKnowledge(
+        research_dir=research,
+        pmid_list_path=pmid_list,
+        source_files=specs,
+    )
+    stats = index.build()
+
+    patterns = [
+        source for source in stats["sources"] if source["label"] == "patterns"
+    ][0]
+    assert patterns["manifest_status"] == "sha256_mismatch"
+    assert patterns["manifest_sha256"] != patterns["sha256"]
+    assert any(
+        "corpus_file_hash_differs_from_manifest" in warning
+        for warning in stats["warnings"]
+    )
+    # The edited file is still served: the warning says it is off-snapshot, and
+    # answering nothing would turn a provenance problem into an empty corpus.
+    assert stats["n_hits_indexed"] > 0
+
+
+def test_corpus_without_manifest_is_reported(tmp_path):
+    research, specs, pmid_list = write_corpus(tmp_path)
+    (research / "corpus" / "manifest.json").unlink()
+
+    index = SK.ScopeKnowledge(
+        research_dir=research,
+        pmid_list_path=pmid_list,
+        source_files=specs,
+    )
+    stats = index.build()
+
+    assert stats["corpus_manifest"]["status"] == "absent"
+    assert stats["corpus_manifest"]["n_sources_covered"] == 0
+    assert all(
+        source["manifest_status"] == "not_listed" for source in stats["sources"]
+    )
+    assert stats["n_hits_indexed"] > 0
+
+
+def test_manifest_from_another_directory_is_not_claimed(tmp_path):
+    """A test corpus must not inherit the shipped manifest's hashes."""
+    research, specs, pmid_list = write_corpus(tmp_path)
+    manifest_path = research / "corpus" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["patterns.jsonl"]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    # Same corpus, but the source specs point at the files outside the corpus
+    # directory this manifest describes.
+    detached = tmp_path / "detached"
+    detached.mkdir()
+    moved = []
+    for kind, name, label in SK.CORPUS_FILES:
+        payload = (research / "corpus" / name).read_bytes()
+        (detached / name).write_bytes(payload)
+        moved.append(SK.SourceSpec(kind, detached / name, label))
+
+    index = SK.ScopeKnowledge(
+        research_dir=tmp_path / "other-research",
+        pmid_list_path=pmid_list,
+        source_files=moved,
+    )
+    stats = index.build()
+    assert stats["corpus_manifest"]["status"] == "absent"
+    assert all(
+        source["manifest_status"] == "not_listed" for source in stats["sources"]
+    )
+
+
 def test_build_is_read_only(tmp_path):
     research, specs, pmid_list = write_corpus(tmp_path)
+    corpus = research / "corpus"
     paths = [
+        corpus / "workflows.jsonl",
+        corpus / "methods.jsonl",
+        corpus / "patterns.jsonl",
+        corpus / "manifest.json",
+        # Build inputs are audit material and must not be rewritten either.
         research / "workflows.jsonl",
         research / "methods.jsonl",
         research / "scope_learn" / "shard_6.jsonl",
@@ -933,7 +1104,7 @@ def test_build_is_read_only(tmp_path):
 
 def test_malformed_line_is_reported_not_indexed(tmp_path):
     research, specs, pmid_list = write_corpus(tmp_path)
-    workflows_path = research / "workflows.jsonl"
+    workflows_path = research / "corpus" / "workflows.jsonl"
     with workflows_path.open("a", encoding="utf-8") as handle:
         handle.write("{this is not json}\n")
 
@@ -966,9 +1137,9 @@ REAL_PMID_LIST = Path(
 
 
 @pytest.mark.skipif(
-    not (REAL_RESEARCH / "workflows.jsonl").is_file()
+    not (REAL_RESEARCH / "corpus" / "workflows.jsonl").is_file()
     or not REAL_PMID_LIST.is_file(),
-    reason="real frozen corpus or 405-PMID inclusion list unavailable",
+    reason="built corpus or 405-PMID inclusion list unavailable",
 )
 def test_real_frozen_corpus_contract():
     index = SK.ScopeKnowledge(
@@ -982,7 +1153,15 @@ def test_real_frozen_corpus_contract():
     assert stats["excluded"]["out_of_scope_records"] > 0
 
     labels = {source["label"] for source in stats["sources"]}
-    assert {"workflows", "methods", "shard_0", "repair_a"} <= labels
+    assert labels == {"workflows", "methods", "patterns"}
+    assert stats["corpus_manifest"]["status"] == "ok"
+    assert stats["corpus_manifest"]["n_sources_covered"] == 3
+    assert all(
+        source["manifest_status"] == "match" for source in stats["sources"]
+    )
+    # Read-time superseded records are 0; the merge count is build provenance.
+    assert stats["excluded"]["superseded_records"] == 0
+    assert stats["corpus_manifest"]["patterns"]["superseded_records"] == 24
 
     page = index.search("pseudobulk", source_kinds="method", limit=5)
     assert page["status"] == "ok"

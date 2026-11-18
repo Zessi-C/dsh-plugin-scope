@@ -57,7 +57,7 @@ MAX_LIST_PAGE = 200
 SNAPSHOT_ID_RE = re.compile(r"^src_[0-9a-f]{20}$")
 PMCID_RE = re.compile(r"^PMC[0-9]{1,12}$")
 
-CODE_SOURCES_PATH = PKG_ROOT / "research" / "code_sources.jsonl"
+CODE_SOURCES_PATH = PKG_ROOT / "research" / "corpus" / "code_sources.jsonl"
 MAX_CODE_SOURCES_BYTES = 64 * 1024 * 1024
 DEFAULT_CODE_PAGE = 20
 MAX_CODE_PAGE = 200
@@ -1057,6 +1057,51 @@ def _load_code_records(path: Path) -> tuple[list[dict], str]:
     return rows, sha
 
 
+def _code_sources_manifest(source: Path, file_sha: str) -> dict:
+    """Compare the bytes read with the corpus manifest, when one is present.
+
+    Provenance only: a missing or mismatched manifest is reported, never a
+    reason to answer ``failed``. Test corpora and monkeypatched paths live
+    outside ``research/corpus`` and are reported as ``not_in_corpus``.
+    """
+    manifest_path = source.parent / "manifest.json"
+    out = {
+        "status": "not_in_corpus",
+        "path": str(manifest_path),
+        "schema": None,
+        "file_sha256": str(file_sha),
+        "manifest_sha256": None,
+        "sha256_match": None,
+    }
+    try:
+        in_corpus = source.resolve().parent == CODE_SOURCES_PATH.resolve().parent
+    except OSError:
+        in_corpus = False
+    if not in_corpus:
+        return out
+    out["status"] = "absent"
+    if not manifest_path.is_file():
+        return out
+    try:
+        data = json.loads(manifest_path.read_bytes().decode("utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        out["status"] = "unreadable"
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    files = data.get("files") if isinstance(data, dict) else None
+    entry = files.get(source.name) if isinstance(files, dict) else None
+    if not isinstance(entry, dict):
+        out["status"] = "file_not_listed"
+        return out
+    out["status"] = "ok"
+    out["schema"] = data.get("schema")
+    out["manifest_sha256"] = entry.get("sha256")
+    out["sha256_match"] = entry.get("sha256") == file_sha
+    if not out["sha256_match"]:
+        out["status"] = "sha256_mismatch"
+    return out
+
+
 def _code_sources_path(path: str | None) -> Path | None:
     if path is None:
         return CODE_SOURCES_PATH
@@ -1119,7 +1164,7 @@ def _scope_limitations(scope: dict) -> list[str]:
 def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
                  path: str | None = None,
                  pmid_list_path: str | os.PathLike | None = None) -> dict:
-    """Page the frozen ``research/code_sources.jsonl`` by exact PMID.
+    """Page the frozen ``research/corpus/code_sources.jsonl`` by exact PMID.
 
     The PMID must be in the same configured inclusion list the method registry
     uses: an explicit ``pmid_list_path``, else ``SCOPE_INCLUDED_PMIDS``, else
@@ -1190,7 +1235,7 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
     if source is None:
         return {"status": "failed", "pmid": raw, "records": [],
                 "pmid_in_scope": True, "scope": _scope_meta(scope),
-                "error": "path must be the frozen research/code_sources.jsonl",
+                "error": "path must be the frozen research/corpus/code_sources.jsonl",
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
                 "limitations": ["arbitrary local paths are not readable by this tool"]}
@@ -1211,6 +1256,7 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
                 "total_for_pmid": 0, "total_in_file": len(rows),
                 "pmid_in_scope": True, "scope": _scope_meta(scope),
                 "source_file": str(source), "file_sha256": file_sha,
+                "corpus_manifest": _code_sources_manifest(source, file_sha),
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
                 "limitations": ["no extraction record for this PMID; that is "
@@ -1242,6 +1288,7 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
         "scope": _scope_meta(scope),
         "source_file": str(source),
         "file_sha256": file_sha,
+        "corpus_manifest": _code_sources_manifest(source, file_sha),
         "claims_verified": False,
         "evidence_status": "corpus_record_unverified",
         "limitations": [

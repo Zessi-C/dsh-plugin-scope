@@ -112,7 +112,6 @@
               extendedPromptOrder: 12050
               researchDir: research
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
-              preferRepairs: true
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
               manifestTimeoutMs: 60000
@@ -196,7 +195,6 @@
               extendedPromptOrder: 12050
               researchDir: research
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
-              preferRepairs: true
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
               manifestTimeoutMs: 60000
@@ -299,7 +297,6 @@
               extendedPromptOrder: 12050
               researchDir: research
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
-              preferRepairs: true
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
               manifestTimeoutMs: 60000
@@ -395,7 +392,6 @@
               extendedPromptOrder: 12050
               researchDir: research
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
-              preferRepairs: true
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
               manifestTimeoutMs: 60000
@@ -489,7 +485,6 @@
               extendedPromptOrder: 12050
               researchDir: research
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
-              preferRepairs: true
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
               manifestTimeoutMs: 60000

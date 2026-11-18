@@ -3,7 +3,7 @@
 No test here touches the network. DNS and the single HTTP seam
 (`method_sources._open_url`) are monkeypatched; the paper path is exercised by
 faking `literature.http_get`, which leaves the real JATS parser and rendering in
-play. Real reads are limited to the frozen `research/code_sources.jsonl` and the
+play. Real reads are limited to the frozen `research/corpus/code_sources.jsonl` and the
 configured inclusion list, both treated as read-only; every other fixture is a
 temporary file.
 """
@@ -464,7 +464,7 @@ def test_code_sources_rejects_bad_pmid_and_arbitrary_path(tmp_path, monkeypatch)
     blocked = ms.code_sources("1", path=str(elsewhere),
                               pmid_list_path=list_path)
     assert blocked["status"] == "failed"
-    assert "frozen research/code_sources.jsonl" in blocked["error"]
+    assert "frozen research/corpus/code_sources.jsonl" in blocked["error"]
 
 
 def test_code_sources_refuses_out_of_scope_pmid_without_reading_corpus(
@@ -604,8 +604,64 @@ def test_real_code_sources_corpus_is_readable_without_modification():
     assert result["pmid_in_scope"] is True
     assert result["scope"]["n_included_pmids"] >= 1
     assert result["total_in_file"] > 1000
+    # The corpus manifest vouches for the bytes that were read.
+    assert result["corpus_manifest"]["status"] == "ok"
+    assert result["corpus_manifest"]["sha256_match"] is True
+    assert result["corpus_manifest"]["manifest_sha256"] == result["file_sha256"]
     if result["status"] == "ok":
         assert all(r["verified"] is False for r in result["records"])
+
+
+def test_a_monkeypatched_corpus_path_without_a_manifest_reports_absent(
+        tmp_path, monkeypatch):
+    """The patched path becomes the corpus root, so its missing manifest shows."""
+    path = write_code_corpus(tmp_path)
+    list_path = write_pmid_list(tmp_path, ("1",))
+    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    result = ms.code_sources("1", pmid_list_path=list_path)
+    assert result["status"] == "ok"
+    assert result["corpus_manifest"]["status"] == "absent"
+    assert result["corpus_manifest"]["sha256_match"] is None
+    assert result["file_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    (path.parent / "manifest.json").write_text(json.dumps({
+        "schema": "sctda.corpus_manifest/1",
+        "files": {"code_sources.jsonl": {
+            "sha256": result["file_sha256"]}},
+    }), encoding="utf-8")
+    again = ms.code_sources("1", pmid_list_path=list_path)
+    assert again["corpus_manifest"]["status"] == "ok"
+    assert again["corpus_manifest"]["sha256_match"] is True
+
+
+def test_stale_manifest_hash_is_reported_against_the_real_corpus(tmp_path):
+    """A corpus file edited after the manifest was written is flagged, not hidden."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    source = ms.CODE_SOURCES_PATH
+    if not source.is_file():
+        pytest.skip("frozen code_sources.jsonl unavailable")
+    payload = source.read_bytes()
+    (corpus / "code_sources.jsonl").write_bytes(payload)
+    manifest = json.loads(
+        (source.parent / "manifest.json").read_bytes().decode("utf-8")
+    )
+    manifest["files"]["code_sources.jsonl"]["sha256"] = "0" * 64
+    (corpus / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    # `code_sources` only serves the canonical path, so a temp directory can
+    # only be compared through the helper: it must not claim the manifest of a
+    # directory it is not in.
+    out = ms._code_sources_manifest(
+        corpus / "code_sources.jsonl",
+        hashlib.sha256(payload).hexdigest(),
+    )
+    assert out["status"] == "not_in_corpus"
+
+    out = ms._code_sources_manifest(source, "0" * 64)
+    assert out["status"] == "sha256_mismatch"
+    assert out["manifest_sha256"] and out["manifest_sha256"] != "0" * 64
+    assert out["schema"] == "sctda.corpus_manifest/1"
 
 
 

@@ -17,6 +17,8 @@ The shipped preset config uses `/data/disk1/zeiss/llm-agent` for `kernelRoot` an
 
 `src/`, `r/`, and `sctda` are the research kernel. `lib/`, `bridge/`, `prompts/`, and `cordis.patch.yml` are the DSH plugin. Installing only the npm package does **not** install the kernel or corpus. A missing corpus/list is reported as unavailable; do not infer that an empty catalog is complete.
 
+The runtime corpus is `research/corpus/{methods,workflows,code_sources,patterns}.jsonl` with `research/corpus/manifest.json`; supply these files separately under the configured research directory. `patterns.jsonl` is the consolidated snapshot; the manifest and `provenance/` record its build sources. Original text and extracts are not included here. Search hits remain unverified leads and must be checked against original sources.
+
 ## Status and limitations
 
 The corpus extraction is incomplete; a literature mention is not a working adapter. Currently wired operations are composition, Seurat FindMarkers candidate-vs-rest, AUCell scoring and inferCNV. Group-condition contrasts and arbitrary analysis execution are not wired. Agent roles use tool-level restrictions, not an OS security sandbox. New method search and ledger functionality has not yet been validated in a complete real-model multi-agent workflow. External source fetches use public-address pinning without proxies and may be unavailable on networks requiring a proxy.

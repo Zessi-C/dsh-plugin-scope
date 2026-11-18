@@ -597,7 +597,7 @@ def test_missing_arguments_and_cross_references_raise(root):
 
 
 def test_the_frozen_corpus_is_not_written(root):
-    corpus = ROOT / "research" / "methods.jsonl"
+    corpus = ROOT / "research" / "corpus" / "methods.jsonl"
     if not corpus.exists():
         pytest.skip("frozen corpus not present")
     before = sha256_file(corpus)

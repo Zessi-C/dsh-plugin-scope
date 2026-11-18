@@ -7,16 +7,26 @@ to the corpus.
 
 What it reads
 -------------
-``<research>/workflows.jsonl``
+The corpus lives in ``<research>/corpus`` and is produced by
+``tools/build_corpus.py``; the extraction shards under ``research/shards`` and
+``research/scope_learn`` are build inputs retained for audit, never read here.
+
+``<research>/corpus/workflows.jsonl``
     One record per paper: question, comparison, cell level, ordered steps
     (observation -> next analysis -> rationale), claims and gaps.
-``<research>/methods.jsonl``
+``<research>/corpus/methods.jsonl``
     One record per method instance with locator, verbatim sentence, operation,
     stage and stated constraints.
-``<research>/scope_learn/shard_*.jsonl`` and ``repair_*.jsonl``
-    Per-paper reasoning patterns with a brief locator or a PDF page anchor.
-    When both exist, ``repair_*`` replaces the older ``shard_*`` record for the
-    same PMID; the old shard record is indexed only if ``prefer_repairs=False``.
+``<research>/corpus/patterns.jsonl``
+    One pattern record per PMID with a brief locator or a PDF page anchor.
+    The shard -> repair precedence is already applied when the file is built, so
+    this module indexes exactly one record per paper and does no precedence
+    selection. ``manifest.json`` records which source files were merged and how
+    many records a repair superseded; that provenance is reported in ``stats``.
+``<research>/corpus/manifest.json``
+    Per-file sha256, byte size, record count and source files, plus the pattern
+    merge provenance. Every source's sha256 is checked against it; a mismatch is
+    a warning, never silently ignored.
 
 Hard rules
 ----------
@@ -71,6 +81,10 @@ Typical use
     near = idx.context(hit["evidence_id"], before=1, after=1,
                        matched_fields=hit["matched_fields"])
     full = idx.record(hit["pmid"])            # whole frozen extract for one paper
+
+    # Tests index a hand-built corpus instead of the shipped one:
+    idx = ScopeKnowledge(research_dir=root,
+                         source_files=[SourceSpec("pattern", path, "patterns")])
 """
 from __future__ import annotations
 
@@ -105,6 +119,7 @@ __all__ = [
     "TIER_EXTRACTION",
     "TIER_UNVERIFIED",
     "TIER_VERBATIM",
+    "corpus_dir",
     "default_index",
     "locator_section",
     "make_pdf_locator",
@@ -152,7 +167,19 @@ MAX_CONTEXT = 20
 MAX_WARNINGS = 200
 
 PMID_LIST_ENV = "SCOPE_INCLUDED_PMIDS"
+RESEARCH_DIR_ENV = "SCOPE_RESEARCH_DIR"
 DEFAULT_RESEARCH_DIR = Path(__file__).resolve().parent.parent / "research"
+CORPUS_SUBDIR = "corpus"
+CORPUS_MANIFEST_NAME = "manifest.json"
+CORPUS_SCHEMA = "sctda.corpus_manifest/1"
+# The three extraction copies plus the merged pattern file. Names are the
+# contract with ``tools/build_corpus.py``; nothing globs this directory, so a
+# stray file cannot enter the index by accident.
+CORPUS_FILES = (
+    ("workflow", "workflows.jsonl", "workflows"),
+    ("method", "methods.jsonl", "methods"),
+    ("pattern", "patterns.jsonl", "patterns"),
+)
 DEFAULT_PMID_LIST_CANDIDATES = (
     # Only the current inclusion set is a default candidate. The superseded 422
     # list is deliberately not a fallback: a missing current list fails closed
@@ -228,6 +255,12 @@ POLICY = {
     ),
     "ordering": "Deterministic by PMID and source order; no frequency, citation or relevance score.",
     "anchors": "locator+verbatim are passed through; this module does not re-verify anchors.",
+    "corpus": (
+        "Reads the built corpus under <research>/corpus only. The shard -> repair "
+        "precedence is applied at build time, so patterns.jsonl holds one record "
+        "per paper; per-file sha256 and merge provenance come from manifest.json "
+        "and a mismatch is reported as a warning, never silently accepted."
+    ),
     "tiers": {
         TIER_VERBATIM: "The quoted sentence itself states this.",
         TIER_EXTRACTION: "Extractor summary/reconstruction; cite as 'the extraction records ... (unverified)'.",
@@ -884,11 +917,12 @@ class ScopeKnowledge:
             EditorialNotice | Mapping[str, Any]
         ] = (),
         editorial_notices: EditorialNoticeRegistry | None = None,
-        prefer_repairs: bool = True,
         include_out_of_scope: bool = False,
     ) -> None:
         self.research_dir = Path(
-            research_dir if research_dir is not None else DEFAULT_RESEARCH_DIR
+            research_dir
+            if research_dir is not None
+            else (os.environ.get(RESEARCH_DIR_ENV) or DEFAULT_RESEARCH_DIR)
         ).expanduser()
         self.pmid_list_path = (
             Path(pmid_list_path).expanduser() if pmid_list_path is not None else None
@@ -899,7 +933,6 @@ class ScopeKnowledge:
             if expected_pmid_list_sha256
             else None
         )
-        self.prefer_repairs = bool(prefer_repairs)
         self.include_out_of_scope = bool(include_out_of_scope)
         self.retractions = (
             retractions
@@ -921,6 +954,9 @@ class ScopeKnowledge:
             self._coerce_sources(source_files)
             if source_files is not None
             else _default_source_specs(self.research_dir)
+        )
+        self._manifest = _read_corpus_manifest(
+            self.research_dir, self._specs
         )
         self._lock = threading.RLock()
         self._reset()
@@ -1013,6 +1049,9 @@ class ScopeKnowledge:
                 "path": str(spec.path),
                 "status": "missing",
                 "sha256": None,
+                "manifest_status": "unknown",
+                "manifest_sha256": None,
+                "manifest_n_records": None,
                 "n_lines": 0,
                 "n_records": 0,
                 "n_malformed": 0,
@@ -1035,6 +1074,30 @@ class ScopeKnowledge:
                 continue
             stat["status"] = "ok"
             stat["sha256"] = _sha256_bytes(data)
+            manifest_entry = _manifest_entry_for(
+                self._manifest, self.research_dir, spec
+            )
+            if manifest_entry is None:
+                stat["manifest_status"] = "not_listed"
+                if self._manifest.get("status") == "ok":
+                    warn(f"corpus_manifest_missing_file:{spec.label}:{spec.path.name}")
+            else:
+                stat["manifest_status"] = (
+                    "match" if manifest_entry.get("sha256") == stat["sha256"]
+                    else "sha256_mismatch"
+                )
+                stat["manifest_sha256"] = manifest_entry.get("sha256")
+                stat["manifest_n_records"] = manifest_entry.get("n_records")
+                if stat["manifest_status"] == "sha256_mismatch":
+                    # A rebuilt corpus is legitimate; a silently edited one is
+                    # not. The index still serves the bytes it read, but the
+                    # answer says they are not the manifest's snapshot.
+                    warn(
+                        "corpus_file_hash_differs_from_manifest:"
+                        f"{spec.label}:{spec.path.name}:"
+                        f"manifest={manifest_entry.get('sha256')}:"
+                        f"actual={stat['sha256']}"
+                    )
             text = data.decode("utf-8-sig", errors="replace")
             lines = text.splitlines()
             stat["n_lines"] = len(lines)
@@ -1066,14 +1129,6 @@ class ScopeKnowledge:
                     }
                 )
 
-        repair_pmids: set[str] = set()
-        if self.prefer_repairs:
-            for entry in entries:
-                if entry["spec"].label.startswith("repair_"):
-                    pmid = _extract_pmid(entry["record"])
-                    if pmid:
-                        repair_pmids.add(pmid)
-
         retraction_res = [
             (pmid, re.compile(rf"(?<!\d){re.escape(pmid)}(?!\d)"))
             for pmid in sorted(self.retractions.pmids)
@@ -1082,6 +1137,11 @@ class ScopeKnowledge:
         excluded = {
             "retracted_records": 0,
             "retracted_reference_records": 0,
+            # Read-time only. The shard -> repair precedence is applied when the
+            # corpus is built, so patterns.jsonl has one record per paper and
+            # nothing is dropped at read time; the build-time merge count (24)
+            # is reported under `corpus_manifest.patterns.superseded_records`
+            # and must not be added to these counters.
             "superseded_records": 0,
             "unattributed_records": 0,
             "out_of_scope_records": 0,
@@ -1116,14 +1176,6 @@ class ScopeKnowledge:
                 # is not allowed to pose as evidence, even if its own pmid is
                 # missing or points elsewhere.
                 excluded["retracted_reference_records"] += 1
-                continue
-
-            if (
-                self.prefer_repairs
-                and spec.label.startswith("shard_")
-                and pmid in repair_pmids
-            ):
-                excluded["superseded_records"] += 1
                 continue
 
             if scope["mode"] == "included":
@@ -1221,6 +1273,7 @@ class ScopeKnowledge:
                 "n_duplicates": scope.get("n_duplicates", 0),
             },
             "sources": source_stats,
+            "corpus_manifest": copy.deepcopy(self._manifest),
             "n_records_loaded": len(entries),
             "n_records_indexed": sum(
                 1 for entries_for_pmid in self._records_by_pmid.values()
@@ -2273,6 +2326,14 @@ def _pattern_units(record: Mapping[str, Any], pmid: str | None) -> list[dict[str
 # ------------------------------------------------------------------ source setup
 
 
+def corpus_dir(research_dir: str | Path | None = None) -> Path:
+    """Return ``<research>/corpus``; never globs, never falls back to shards."""
+    base = Path(
+        research_dir if research_dir is not None else DEFAULT_RESEARCH_DIR
+    ).expanduser()
+    return base / CORPUS_SUBDIR
+
+
 def _infer_source_kind(path: Path) -> str:
     name = path.name.casefold()
     if name.startswith("workflows"):
@@ -2282,23 +2343,110 @@ def _infer_source_kind(path: Path) -> str:
     return "pattern"
 
 
-def _shard_sort_key(path: Path) -> tuple[int, str]:
-    match = re.search(r"(\d+)$", path.stem)
-    return (int(match.group(1)) if match else 10**9, path.stem)
-
-
 def _default_source_specs(research_dir: Path) -> list[SourceSpec]:
-    specs = [
-        SourceSpec("workflow", research_dir / "workflows.jsonl", "workflows"),
-        SourceSpec("method", research_dir / "methods.jsonl", "methods"),
+    """The three formal corpus files, in a fixed order.
+
+    Labels are the file stems (``workflows``/``methods``/``patterns``) so that a
+    hit's ``source_label`` names the shipped file. Missing files are reported as
+    missing sources; no fallback scans the shard directories.
+    """
+    root = corpus_dir(research_dir)
+    return [
+        SourceSpec(kind, root / name, label)
+        for kind, name, label in CORPUS_FILES
     ]
-    learn_dir = research_dir / "scope_learn"
-    if learn_dir.is_dir():
-        for path in sorted(learn_dir.glob("shard_*.jsonl"), key=_shard_sort_key):
-            specs.append(SourceSpec("pattern", path, path.stem))
-        for path in sorted(learn_dir.glob("repair_*.jsonl")):
-            specs.append(SourceSpec("pattern", path, path.stem))
-    return specs
+
+
+def _manifest_entry_for(
+    manifest: Mapping[str, Any], research_dir: Path, spec: SourceSpec
+) -> dict | None:
+    """Manifest row for one source, only when it names *this* directory.
+
+    Matching by file name alone would let a test corpus called
+    ``patterns.jsonl`` inherit the shipped snapshot's hash and be reported as
+    tampered with. The parent directory must be the corpus directory too.
+    """
+    files = manifest.get("files") or {}
+    if not isinstance(files, Mapping):
+        return None
+    try:
+        in_corpus = (
+            spec.path.resolve().parent
+            == corpus_dir(research_dir).resolve()
+        )
+    except OSError:
+        return None
+    if not in_corpus:
+        return None
+    entry = files.get(spec.path.name)
+    return dict(entry) if isinstance(entry, Mapping) else None
+
+
+def _read_corpus_manifest(
+    research_dir: Path, specs: Sequence[SourceSpec]
+) -> dict[str, Any]:
+    """Read ``<research>/corpus/manifest.json`` and relate it to the sources.
+
+    The manifest is provenance, not a gate: an absent or unreadable manifest is
+    reported (``status`` other than ``ok``) and the index is still built from
+    the files it can read. When a listed file is actually indexed, its sha256
+    and record count are compared against the manifest; the comparison is
+    reported per source and by warning, never by silently dropping the source.
+    """
+    path = corpus_dir(research_dir) / CORPUS_MANIFEST_NAME
+    out: dict[str, Any] = {
+        "status": "absent",
+        "path": str(path),
+        "schema": None,
+        "generated_utc": None,
+        "files": {},
+        "patterns": None,
+        "pmid_range": None,
+        "n_sources_covered": 0,
+        "error": None,
+    }
+    if not path.is_file():
+        return out
+    try:
+        data = json.loads(path.read_bytes().decode("utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        out["status"] = "unreadable"
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    if not isinstance(data, dict):
+        out["status"] = "unreadable"
+        out["error"] = f"manifest is {type(data).__name__}, not an object"
+        return out
+    declared = data.get("files")
+    files = {
+        str(name): dict(entry)
+        for name, entry in (declared.items() if isinstance(declared, dict) else ())
+        if isinstance(entry, dict)
+    }
+    patterns = data.get("patterns")
+    out.update(
+        {
+            "status": "ok",
+            "schema": data.get("schema"),
+            "generated_utc": data.get("generated_utc"),
+            "files": files,
+            "patterns": dict(patterns) if isinstance(patterns, dict) else None,
+            "pmid_range": (
+                dict(data["pmid_range"])
+                if isinstance(data.get("pmid_range"), dict) else None
+            ),
+        }
+    )
+    out["n_sources_covered"] = sum(
+        1 for spec in specs
+        if _manifest_entry_for(out, research_dir, spec) is not None
+    )
+    if out["schema"] != CORPUS_SCHEMA:
+        out["status"] = "schema_mismatch"
+        out["error"] = (
+            f"manifest schema is {out['schema']!r}, expected {CORPUS_SCHEMA!r}"
+        )
+    return out
 
 
 def _values_for(hit: KnowledgeHit, key: str) -> set[str]:

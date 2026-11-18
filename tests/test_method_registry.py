@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -594,6 +595,13 @@ def test_real_corpus_scope_and_retraction(real_registry):
     assert stats["scope"]["n_effective_pmids"] == 404
     assert stats["corpus"]["sha256"]
     assert stats["corpus"]["n_parse_errors"] == 0
+    # The methods file read is the one the corpus manifest describes.
+    manifest = stats["corpus"]["manifest"]
+    assert manifest["status"] == "ok"
+    assert manifest["sha256_match"] is True
+    assert manifest["file_entry"]["n_records"] == stats["corpus"]["n_records_parsed"]
+    assert manifest["patterns"]["superseded_records"] == 24
+    assert Path(stats["corpus"]["path"]).parent.name == "corpus"
 
     all_pmids = {p for m in real_registry.load()["methods"] for p in m["pmids"]}
     assert "36450980" not in all_pmids

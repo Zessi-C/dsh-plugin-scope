@@ -128,7 +128,6 @@ def main() -> int:
         index = ScopeKnowledge(
             research_dir=research_dir,
             pmid_list_path=pmid_list_path,
-            prefer_repairs=bool(config.get("prefer_repairs", True)),
         )
     except CorpusConfigError as exc:
         return emit({"status": "error", "error_kind": "corpus_config",

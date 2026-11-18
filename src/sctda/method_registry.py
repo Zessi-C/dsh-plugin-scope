@@ -2,7 +2,8 @@
 
 What this module is
 -------------------
-`research/methods.jsonl` is an open-vocabulary extraction: it contains method
+``research/corpus/methods.jsonl`` (built by ``tools/build_corpus.py`` from the
+extraction shards) is an open-vocabulary extraction: it contains method
 instances that are only mentioned, methods used only for QC, upstream
 quantification steps, instruments, and so on. This registry applies the *record
 layer* of the project scope and aggregates the survivors by canonical name:
@@ -68,7 +69,13 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
-METHODS_PATH = ROOT / "research/methods.jsonl"
+# The built corpus, produced by tools/build_corpus.py, plus its provenance
+# manifest. The extraction inputs (research/methods.jsonl and the shard files)
+# stay on disk for audit but are not read at runtime.
+CORPUS_DIR = ROOT / "research" / "corpus"
+METHODS_PATH = CORPUS_DIR / "methods.jsonl"
+CORPUS_MANIFEST_PATH = CORPUS_DIR / "manifest.json"
+CORPUS_MANIFEST_SCHEMA = "sctda.corpus_manifest/1"
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 500
 SCHEMA = "sctda.method_registry/1"
@@ -220,6 +227,62 @@ def _slug(value: str) -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _corpus_manifest_entry(
+    methods_path: Path, corpus_sha: str
+) -> dict[str, Any]:
+    """Relate the methods file actually read to ``corpus/manifest.json``.
+
+    Provenance only: a missing, unreadable or non-matching manifest does not
+    block the registry, it is reported. An explicit alternate ``methods_path``
+    (tests, historical snapshots) is only checked against a manifest sitting in
+    its own directory, so a temp corpus never inherits the shipped hashes.
+    """
+    out: dict[str, Any] = {
+        "status": "absent",
+        "path": str(methods_path.parent / CORPUS_MANIFEST_PATH.name),
+        "schema": None,
+        "generated_utc": None,
+        "file_entry": None,
+        "sha256_match": None,
+        "patterns": None,
+        "error": None,
+    }
+    path = out["path"]
+    if not Path(path).is_file():
+        return out
+    try:
+        data = json.loads(Path(path).read_bytes().decode("utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        out["status"] = "unreadable"
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    if not isinstance(data, dict):
+        out["status"] = "unreadable"
+        out["error"] = f"manifest is {type(data).__name__}, not an object"
+        return out
+    files = data.get("files")
+    entry = files.get(methods_path.name) if isinstance(files, dict) else None
+    patterns = data.get("patterns")
+    out.update({
+        "status": "ok",
+        "schema": data.get("schema"),
+        "generated_utc": data.get("generated_utc"),
+        "file_entry": dict(entry) if isinstance(entry, dict) else None,
+        "patterns": dict(patterns) if isinstance(patterns, dict) else None,
+    })
+    if out["schema"] != CORPUS_MANIFEST_SCHEMA:
+        out["status"] = "schema_mismatch"
+    if isinstance(entry, dict):
+        out["sha256_match"] = entry.get("sha256") == corpus_sha
+        if not out["sha256_match"]:
+            warnings_note = (
+                "the methods file read is not the manifest snapshot "
+                f"(manifest {entry.get('sha256')}, actual {corpus_sha})"
+            )
+            out["warning"] = warnings_note
+    return out
 
 
 def _pmid_sort_key(pmid: str) -> tuple[int, str]:
@@ -690,6 +753,7 @@ class MethodRegistry:
             "n_records_in_scope": n_records_in_scope,
             "n_records_after_scope": n_qualifying,
             "n_records_qualifying": n_qualifying,
+            "manifest": _corpus_manifest_entry(self.methods_path, corpus_sha),
         }
 
         self._scope = {
@@ -762,6 +826,20 @@ class MethodRegistry:
             "rerunnable_role=upstream_background is preserved as a record flag "
             "and count, not used to filter methods out.",
         ]
+        manifest = self._corpus["manifest"]
+        if manifest["status"] == "absent":
+            self._notes.append(
+                "corpus/manifest.json was not found next to the methods file; "
+                "the file was read as-is and its provenance is unverified."
+            )
+        elif manifest["status"] != "ok":
+            self._notes.append(
+                f"corpus/manifest.json is unusable ({manifest['status']}: "
+                f"{manifest['error'] or 'schema mismatch'}); the methods file "
+                "was read as-is and its provenance is unverified."
+            )
+        elif manifest["sha256_match"] is False:
+            self._notes.append(manifest["warning"])
         if not scope_list["matches_known_snapshot"]:
             known_snapshot = scope_list["known_snapshot"]
             if known_snapshot is not None and known_snapshot.get("status") == "superseded":
