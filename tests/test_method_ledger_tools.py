@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from sctda.harness import TOOLS, invoke_tool, tool_manifest  # noqa: E402
-from sctda.method_registry import read_pmid_list  # noqa: E402
 from sctda.project import Project  # noqa: E402
 
 
@@ -266,22 +265,17 @@ def test_source_read_never_invents_text_for_an_unknown_snapshot(tmp_path):
     assert "text" not in out
 
 
-def test_code_sources_reads_the_frozen_file_and_marks_records_unverified():
-    try:
-        scope = read_pmid_list(None)
-    except (FileNotFoundError, ValueError) as exc:
-        pytest.skip(str(exc))
-    if "32997960" not in scope["pmid_set"]:
-        pytest.skip("the configured inclusion list does not contain 32997960")
+def test_code_sources_reads_sqlite_and_marks_records_unverified(corpus_405_scope):
+    scope = corpus_405_scope
     out = invoke_tool("sctda_code_sources", {
         "pmid": "32997960", "page_size": 5, "pmid_list_path": scope["path"],
     })
-    assert out["status"] in ("ok", "not_found"), out
+    assert out["status"] == "ok", out
     assert out["pmid_in_scope"] is True
     assert out["scope"]["n_included_pmids"] >= 1
     assert out["claims_verified"] is False
-    if out["status"] == "ok":
-        assert out["file_sha256"]
-        for record in out["records"]:
-            assert record["verified"] is False
-            assert record["verification"] == "unchecked"
+    assert out["file_sha256"]
+    assert out["records"]
+    for record in out["records"]:
+        assert record["verified"] is False
+        assert record["verification"] == "unchecked"

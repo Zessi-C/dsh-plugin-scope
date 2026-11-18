@@ -107,5 +107,6 @@ python3 tools/build_runtime_corpus.py --check
 ```
 
 The public suite uses synthetic fixtures. Private extraction and locator-repair tests are not shipped; real-corpus checks require a privately provisioned database and inputs.
+To run the live retrieval checks, set `SCOPE_CORPUS_DB` to the private SQLite file and `SCOPE_INCLUDED_PMIDS` to the frozen `included_pmids_405.txt`. A checkout without the private defaults skips those checks; a supplied incompatible database is a test failure.
 
 Source text and data remain the property of their respective owners. No external paper corpus is included.

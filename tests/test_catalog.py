@@ -584,15 +584,8 @@ def test_real_registry_scope_and_exact_adapter_distinctions():
     assert catalog.literature_backing("composition", detail=True)["found"] is False
 
 
-def test_real_catalog_summary_is_405_scoped_and_does_not_page_unbounded():
-    pytest.importorskip("sctda.method_registry")
-    list_path = Path("/data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt")
-    if not list_path.exists():
-        pytest.skip("405-PMID inclusion list unavailable")
-    pmids = {line.strip() for line in
-             list_path.read_text(encoding="utf-8").splitlines() if line.strip()}
-    if not pmids:
-        pytest.skip("405-PMID inclusion list unavailable")
+def test_real_catalog_summary_is_405_scoped_and_does_not_page_unbounded(corpus_405_scope):
+    pmids = corpus_405_scope["pmid_set"]
     out = catalog.catalog_summary()
     assert out["status"] == "ok"
     assert out["n_executable"] == 4
@@ -626,9 +619,9 @@ def test_real_catalog_summary_is_405_scoped_and_does_not_page_unbounded():
             assert detail["instances_omitted"] is True
 
 
-def test_real_seurat_query_surfaces_named_entry_with_match_label():
-    pytest.importorskip("sctda.method_registry")
+def test_real_seurat_query_surfaces_named_entry_with_match_label(corpus_405_scope):
     out = catalog.catalog_summary(query="seurat", limit=50)
+    assert out["status"] == "ok", out
     by_name = {r["canonical_name"]: r for r in out["discovered"]}
     assert "Seurat" in by_name, (
         "name hits must not be buried by package-only hits in the default page")

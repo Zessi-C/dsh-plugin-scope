@@ -1,6 +1,7 @@
 """Shared fixtures: one imported project over the synthetic object."""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -9,10 +10,29 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from scope_corpus import DB_ENV, RESEARCH_DIR_ENV, resolve_db_path  # noqa: E402
 from sctda.ingest import import_dataset  # noqa: E402
+from sctda.method_registry import PMID_LIST_ENV, read_pmid_list  # noqa: E402
 from sctda.project import Project  # noqa: E402
 
 SYNTH = ROOT / "tests/data/synthetic.rds"
+
+
+@pytest.fixture(scope="session")
+def corpus_405_scope():
+    """Skip absent private defaults, not broken explicit configuration."""
+    db = resolve_db_path()
+    if not db.exists() and not (os.environ.get(DB_ENV) or os.environ.get(RESEARCH_DIR_ENV)):
+        pytest.skip("private SQLite corpus not provisioned")
+    assert db.is_file(), f"configured SQLite corpus is not a file: {db}"
+    try:
+        scope = read_pmid_list()
+    except FileNotFoundError as exc:
+        if os.environ.get(PMID_LIST_ENV):
+            raise
+        pytest.skip(str(exc))
+    assert scope["matches_known_snapshot"], "live tests require the frozen 405-PMID list"
+    return scope
 
 
 @pytest.fixture(scope="session")
