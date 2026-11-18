@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -195,6 +196,16 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sctda", description="SCTDA research kernel")
+    # Corpus configuration is process-wide, not per-subcommand: the method
+    # registry and the code-source reader resolve it from the environment, so
+    # every subcommand (and the tools/harness path that re-enters this process)
+    # must see the same values. ``main()`` copies these onto the environment.
+    p.add_argument("--research-dir", default=None,
+                   help="corpus research directory (sets SCOPE_RESEARCH_DIR); "
+                        "default: the checkout's research/")
+    p.add_argument("--corpus-db", default=None,
+                   help="runtime corpus database (sets SCOPE_CORPUS_DB); "
+                        "default: <research-dir>/corpus/records.sqlite")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pi = sub.add_parser("import", help="import a Seurat object into a project")
@@ -322,8 +333,24 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def apply_corpus_env(args: argparse.Namespace) -> None:
+    """Forward the global corpus options to the shared resolver's environment.
+
+    ``scope_corpus.resolve_research_dir``/``resolve_db_path`` (used by
+    ``scope_knowledge``, ``method_registry`` and ``method_sources``) read
+    ``SCOPE_RESEARCH_DIR``/``SCOPE_CORPUS_DB``. A flag that is not given is left
+    alone, so an already-exported environment wins rather than being unset by
+    an unrelated CLI call.
+    """
+    if getattr(args, "research_dir", None):
+        os.environ["SCOPE_RESEARCH_DIR"] = str(args.research_dir)
+    if getattr(args, "corpus_db", None):
+        os.environ["SCOPE_CORPUS_DB"] = str(args.corpus_db)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    apply_corpus_env(args)
     return args.func(args)
 
 

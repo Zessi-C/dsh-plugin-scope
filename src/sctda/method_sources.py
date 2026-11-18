@@ -30,6 +30,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -57,8 +58,6 @@ MAX_LIST_PAGE = 200
 SNAPSHOT_ID_RE = re.compile(r"^src_[0-9a-f]{20}$")
 PMCID_RE = re.compile(r"^PMC[0-9]{1,12}$")
 
-CODE_SOURCES_PATH = PKG_ROOT / "research" / "corpus" / "code_sources.jsonl"
-MAX_CODE_SOURCES_BYTES = 64 * 1024 * 1024
 DEFAULT_CODE_PAGE = 20
 MAX_CODE_PAGE = 200
 
@@ -1027,74 +1026,111 @@ def list_snapshots(project: str, kind: str | None = None,
 
 # --------------------------------------------------------------- code corpus
 
-_CODE_CACHE: dict[tuple[str, int, int], tuple[list[dict], str]] = {}
+_CODE_CACHE: dict[
+    tuple[Path, int, int, frozenset[str]],
+    tuple[list[dict], str, dict, set[str]],
+] = {}
 
 
-def _load_code_records(path: Path) -> tuple[list[dict], str]:
-    stat = path.stat()
-    key = (str(path), stat.st_mtime_ns, stat.st_size)
-    cached = _CODE_CACHE.get(key)
+def _code_db_path(path: str | None) -> Path | None:
+    """Resolve the runtime database; ``path`` may only name the default file.
+
+    ``path`` exists for callers that pin a specific database (tests, a
+    deliberately detached runtime). It is refused when it is not named
+    ``records.sqlite``, so an arbitrary local file cannot be read through this
+    tool.
+    """
+    try:
+        import scope_corpus as SC  # noqa: PLC0415 - shared resolver
+    except Exception:  # noqa: BLE001
+        return None
+    if path is not None:
+        try:
+            candidate = Path(path).expanduser()
+        except (TypeError, ValueError):
+            return None
+        if candidate.name != SC.DB_NAME:
+            return None
+        return SC.resolve_db_path(None, candidate)
+    return SC.resolve_db_path(None, None)
+
+
+def _load_code_records(
+    db_path: Path, retracted: frozenset[str]
+) -> tuple[list[dict], str, dict, set[str]]:
+    """Eligible payloads, file digest, provenance, and blocked owner PMIDs.
+
+    Two gates apply. The frozen ``retracted_ref`` flag drops rows the build
+    already knew to mention a retracted paper; the live registry drops rows
+    whose raw JSON mentions a PMID that is retracted *now* (read from the
+    build's ``pmid_refs`` relation, which covers projection-dropped fields).
+    """
+    stat = db_path.stat()
+    cache_key = (db_path, stat.st_mtime_ns, stat.st_size, retracted)
+    cached = _CODE_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    if stat.st_size > MAX_CODE_SOURCES_BYTES:
-        raise ValueError(f"{path} exceeds {MAX_CODE_SOURCES_BYTES} bytes")
-    data = path.read_bytes()
-    rows: list[dict] = []
-    for number, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{path.name} line {number}: {exc}") from exc
-        if not isinstance(record, dict):
-            raise ValueError(f"{path.name} line {number}: record is not an object")
-        rows.append(record)
-    sha = hashlib.sha256(data).hexdigest()
+    import scope_corpus as SC  # noqa: PLC0415 - shared reader module
+
+    conn = SC.open_db(db_path, require_fts=False)
+    try:
+        meta = SC.read_meta(conn)
+        mentioned = SC.pmids_mentioning(conn, sorted(retracted), owner="code_source")
+        rows = SC.code_source_rows(conn, exclude_retracted_ref=False)
+    finally:
+        conn.close()
+    blocked_pmids = set()
+    payloads = []
+    for row in rows:
+        if row["retracted_ref"] or str(row["rowid"]) in mentioned:
+            blocked_pmids.add(row["pmid"])
+        else:
+            payloads.append(row["payload"])
+    provenance = {
+        "database": str(db_path),
+        "schema_id": meta.get("schema_id"),
+        "schema_version": meta.get("schema_version"),
+        "generator": meta.get("generator"),
+        "built_utc": meta.get("built_utc"),
+        "corpus_fingerprint": meta.get("corpus_fingerprint"),
+        "file_sha256": (meta.get("source_files") or {}).get("code_sources.jsonl"),
+        "corpus_manifest": meta.get("corpus_manifest"),
+        "n_pmid_refs_excluded": len(mentioned),
+    }
+    sha = str(provenance["file_sha256"] or "")
     if len(_CODE_CACHE) > 8:
         _CODE_CACHE.clear()
-    _CODE_CACHE[key] = (rows, sha)
-    return rows, sha
+    result = (payloads, sha, provenance, blocked_pmids)
+    _CODE_CACHE[cache_key] = result
+    return result
 
 
-def _code_sources_manifest(source: Path, file_sha: str) -> dict:
-    """Compare the bytes read with the corpus manifest, when one is present.
+def _code_sources_manifest(provenance: Mapping[str, Any], file_sha: str) -> dict:
+    """Relate the projected rows to the corpus manifest recorded at build time.
 
     Provenance only: a missing or mismatched manifest is reported, never a
-    reason to answer ``failed``. Test corpora and monkeypatched paths live
-    outside ``research/corpus`` and are reported as ``not_in_corpus``.
+    reason to answer ``failed``.
     """
-    manifest_path = source.parent / "manifest.json"
+    manifest = provenance.get("corpus_manifest")
     out = {
-        "status": "not_in_corpus",
-        "path": str(manifest_path),
+        "status": "absent",
+        "path": None,
         "schema": None,
         "file_sha256": str(file_sha),
         "manifest_sha256": None,
         "sha256_match": None,
+        "source": "corpus_database",
     }
-    try:
-        in_corpus = source.resolve().parent == CODE_SOURCES_PATH.resolve().parent
-    except OSError:
-        in_corpus = False
-    if not in_corpus:
+    if not isinstance(manifest, Mapping):
         return out
-    out["status"] = "absent"
-    if not manifest_path.is_file():
-        return out
-    try:
-        data = json.loads(manifest_path.read_bytes().decode("utf-8-sig"))
-    except (OSError, ValueError) as exc:
-        out["status"] = "unreadable"
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        return out
-    files = data.get("files") if isinstance(data, dict) else None
-    entry = files.get(source.name) if isinstance(files, dict) else None
-    if not isinstance(entry, dict):
+    files = manifest.get("files")
+    entry = files.get("code_sources.jsonl") if isinstance(files, Mapping) else None
+    if not isinstance(entry, Mapping):
         out["status"] = "file_not_listed"
+        out["schema"] = manifest.get("schema")
         return out
     out["status"] = "ok"
-    out["schema"] = data.get("schema")
+    out["schema"] = manifest.get("schema")
     out["manifest_sha256"] = entry.get("sha256")
     out["sha256_match"] = entry.get("sha256") == file_sha
     if not out["sha256_match"]:
@@ -1102,17 +1138,17 @@ def _code_sources_manifest(source: Path, file_sha: str) -> dict:
     return out
 
 
-def _code_sources_path(path: str | None) -> Path | None:
-    if path is None:
-        return CODE_SOURCES_PATH
+def _live_retracted_pmids() -> set[str]:
+    """The *live* retraction registry (`scope_knowledge.DEFAULT_RETRACTIONS`).
+
+    Read per call so an extended registry (a notice added at runtime, or a
+    plugin-provided list) is honoured without rebuilding the corpus database.
+    """
     try:
-        candidate = Path(path).resolve()
-        canonical = CODE_SOURCES_PATH.resolve()
-    except OSError:
-        return None
-    if candidate.parent != canonical.parent or candidate.name != canonical.name:
-        return None
-    return candidate
+        import scope_knowledge as SK  # noqa: PLC0415 - lazy, shared registry
+    except Exception:  # noqa: BLE001 - absent module means no live notices
+        return set()
+    return {notice.pmid for notice in SK.DEFAULT_RETRACTIONS}
 
 
 def _inclusion_scope(pmid_list_path: str | os.PathLike | None) -> dict:
@@ -1164,7 +1200,7 @@ def _scope_limitations(scope: dict) -> list[str]:
 def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
                  path: str | None = None,
                  pmid_list_path: str | os.PathLike | None = None) -> dict:
-    """Page the frozen ``research/corpus/code_sources.jsonl`` by exact PMID.
+    """Page the frozen author-code records for one PMID (from the database).
 
     The PMID must be in the same configured inclusion list the method registry
     uses: an explicit ``pmid_list_path``, else ``SCOPE_INCLUDED_PMIDS``, else
@@ -1173,6 +1209,8 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
     ``failed`` rather than falling back to an unfiltered answer. Pass
     ``pmid_list_path`` explicitly only to reproduce a historical scope (e.g.
     ``included_pmids_422.txt``); the answer then reports it as superseded.
+    Retracted PMIDs and papers with only retraction-blocked records answer
+    ``excluded``, not ``not_found``.
 
     These are extraction records, not verified code. Every returned record is
     marked ``verified: false``/``verification: "unchecked"``; ``checked_utc``
@@ -1219,6 +1257,12 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
                 "limitations": ["the configured inclusion list contains no "
                                 "PMID; this tool fails closed instead of "
                                 "treating every paper as out of scope"]}
+    retracted = frozenset(_live_retracted_pmids())
+    if raw in retracted:
+        return {"status": "excluded", "reason": "retracted", "pmid": raw,
+                "records": [], "total_for_pmid": 0, "claims_verified": False,
+                "pmid_in_scope": raw in scope["pmid_set"], "scope": _scope_meta(scope),
+                "evidence_status": "retraction_rejected"}
     if raw not in scope["pmid_set"]:
         return {"status": "out_of_scope", "pmid": raw, "records": [],
                 "total_for_pmid": 0, "pmid_in_scope": False,
@@ -1231,32 +1275,38 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
                     "frozen corpus was not read, and this is not a statement "
                     "about whether author code exists",
                 ] + _scope_limitations(scope)}
-    source = _code_sources_path(path)
+    source = _code_db_path(path)
     if source is None:
         return {"status": "failed", "pmid": raw, "records": [],
                 "pmid_in_scope": True, "scope": _scope_meta(scope),
-                "error": "path must be the frozen research/corpus/code_sources.jsonl",
+                "error": "path must name the runtime corpus database "
+                         "(corpus/records.sqlite)",
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
                 "limitations": ["arbitrary local paths are not readable by this tool"]}
     try:
-        rows, file_sha = _load_code_records(source)
-    except (OSError, ValueError) as exc:
+        rows, file_sha, provenance, blocked_pmids = _load_code_records(source, retracted)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never "not_found"
         return {"status": "failed", "pmid": raw, "records": [],
                 "pmid_in_scope": True, "scope": _scope_meta(scope),
-                "source_file": str(source), "error": str(exc),
+                "source_file": str(source), "error": f"{type(exc).__name__}: {exc}",
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
-                "limitations": ["the corpus could not be read; a failure is not "
-                                "an absence of records"]}
+                "limitations": ["the corpus database could not be read; a "
+                                "failure is not an absence of records"]}
     matched = [record for record in rows
                if str(record.get("pmid") or "").strip() == raw]
     if not matched:
+        if raw in blocked_pmids:
+            return {"status": "excluded", "reason": "retracted_reference", "pmid": raw,
+                    "records": [], "total_for_pmid": 0, "claims_verified": False,
+                    "pmid_in_scope": True, "scope": _scope_meta(scope),
+                    "evidence_status": "retraction_rejected"}
         return {"status": "not_found", "pmid": raw, "records": [],
                 "total_for_pmid": 0, "total_in_file": len(rows),
                 "pmid_in_scope": True, "scope": _scope_meta(scope),
                 "source_file": str(source), "file_sha256": file_sha,
-                "corpus_manifest": _code_sources_manifest(source, file_sha),
+                "corpus_manifest": _code_sources_manifest(provenance, file_sha),
                 "claims_verified": False,
                 "evidence_status": "corpus_record_unverified",
                 "limitations": ["no extraction record for this PMID; that is "
@@ -1288,12 +1338,12 @@ def code_sources(pmid: str, page: int = 1, page_size: int = DEFAULT_CODE_PAGE,
         "scope": _scope_meta(scope),
         "source_file": str(source),
         "file_sha256": file_sha,
-        "corpus_manifest": _code_sources_manifest(source, file_sha),
+        "corpus_manifest": _code_sources_manifest(provenance, file_sha),
         "claims_verified": False,
         "evidence_status": "corpus_record_unverified",
         "limitations": [
-            "code_sources.jsonl is a frozen extraction of paper statements; it "
-            "does not contain fetched repositories or executed code",
+            "the code records are a frozen extraction of paper statements; they "
+            "contain no fetched repositories or executed code",
             "verbatim/locator fields point into the paper text, not into code",
             "a url is a lead; use fetch_source to read it and verify_snapshot "
             "to check the stored bytes, which still does not verify claims",

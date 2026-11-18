@@ -16,7 +16,10 @@ tui = ["textual>=0.60"]
 sctda = "sctda.cli:main"
 
 [tool.setuptools]
-py-modules = ["scope_knowledge"]
+# ``scope_corpus`` is the read-only SQLite reader; it ships as code only. The
+# database it reads is generated locally by tools/build_runtime_corpus.py and is
+# never packaged.
+py-modules = ["scope_knowledge", "scope_corpus"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

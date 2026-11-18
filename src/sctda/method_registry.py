@@ -2,8 +2,9 @@
 
 What this module is
 -------------------
-``research/corpus/methods.jsonl`` (built by ``tools/build_corpus.py`` from the
-extraction shards) is an open-vocabulary extraction: it contains method
+``research/corpus/records.sqlite`` (built by ``tools/build_runtime_corpus.py``
+from the extraction) is read through :mod:`scope_corpus`; its method rows are an
+open-vocabulary extraction: they contain method
 instances that are only mentioned, methods used only for QC, upstream
 quantification steps, instruments, and so on. This registry applies the *record
 layer* of the project scope and aggregates the survivors by canonical name:
@@ -49,7 +50,7 @@ Public API
     registry_backing(method_id, limit=None) -> dict
     registry_adapters_for(canonical_name) -> list[dict]
     load_registry(include_evidence=False) -> dict
-    build_registry(methods_path=None, pmid_list_path=None,
+    build_registry(db_path=None, pmid_list_path=None,
                    retractions=None, executable=None) -> MethodRegistry
     resolve_pmid_list(pmid_list_path=None) -> Path
     read_pmid_list(pmid_list_path=None) -> dict
@@ -69,12 +70,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
-# The built corpus, produced by tools/build_corpus.py, plus its provenance
-# manifest. The extraction inputs (research/methods.jsonl and the shard files)
-# stay on disk for audit but are not read at runtime.
-CORPUS_DIR = ROOT / "research" / "corpus"
-METHODS_PATH = CORPUS_DIR / "methods.jsonl"
-CORPUS_MANIFEST_PATH = CORPUS_DIR / "manifest.json"
+# The runtime corpus database, built by ``tools/build_runtime_corpus.py`` from
+# the built corpus (``tools/build_corpus.py``) and the extraction shards. The
+# JSONL files stay on disk as build inputs and audit material; nothing here
+# reads them.
 CORPUS_MANIFEST_SCHEMA = "sctda.corpus_manifest/1"
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 500
@@ -229,62 +228,6 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _corpus_manifest_entry(
-    methods_path: Path, corpus_sha: str
-) -> dict[str, Any]:
-    """Relate the methods file actually read to ``corpus/manifest.json``.
-
-    Provenance only: a missing, unreadable or non-matching manifest does not
-    block the registry, it is reported. An explicit alternate ``methods_path``
-    (tests, historical snapshots) is only checked against a manifest sitting in
-    its own directory, so a temp corpus never inherits the shipped hashes.
-    """
-    out: dict[str, Any] = {
-        "status": "absent",
-        "path": str(methods_path.parent / CORPUS_MANIFEST_PATH.name),
-        "schema": None,
-        "generated_utc": None,
-        "file_entry": None,
-        "sha256_match": None,
-        "patterns": None,
-        "error": None,
-    }
-    path = out["path"]
-    if not Path(path).is_file():
-        return out
-    try:
-        data = json.loads(Path(path).read_bytes().decode("utf-8-sig"))
-    except (OSError, ValueError) as exc:
-        out["status"] = "unreadable"
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        return out
-    if not isinstance(data, dict):
-        out["status"] = "unreadable"
-        out["error"] = f"manifest is {type(data).__name__}, not an object"
-        return out
-    files = data.get("files")
-    entry = files.get(methods_path.name) if isinstance(files, dict) else None
-    patterns = data.get("patterns")
-    out.update({
-        "status": "ok",
-        "schema": data.get("schema"),
-        "generated_utc": data.get("generated_utc"),
-        "file_entry": dict(entry) if isinstance(entry, dict) else None,
-        "patterns": dict(patterns) if isinstance(patterns, dict) else None,
-    })
-    if out["schema"] != CORPUS_MANIFEST_SCHEMA:
-        out["status"] = "schema_mismatch"
-    if isinstance(entry, dict):
-        out["sha256_match"] = entry.get("sha256") == corpus_sha
-        if not out["sha256_match"]:
-            warnings_note = (
-                "the methods file read is not the manifest snapshot "
-                f"(manifest {entry.get('sha256')}, actual {corpus_sha})"
-            )
-            out["warning"] = warnings_note
-    return out
-
-
 def _pmid_sort_key(pmid: str) -> tuple[int, str]:
     return (len(pmid), pmid)
 
@@ -307,34 +250,75 @@ def _flatten_purposes(value: Any) -> list[str]:
     return []
 
 
-def _string_list(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value] if value.strip() else []
-    if isinstance(value, (list, tuple, set)):
-        return [str(v) for v in value if isinstance(v, str) and v.strip()]
-    return []
+def resolve_db_path(db_path: str | os.PathLike | None = None) -> Path:
+    """Resolve the corpus database to a file, failing closed when absent.
+
+    Order (shared with ``scope_knowledge``): explicit ``db_path``, then
+    ``SCOPE_CORPUS_DB``, then ``<research>/corpus/records.sqlite`` where
+    ``<research>`` is ``SCOPE_RESEARCH_DIR`` or the checkout's ``research/``.
+    A missing database raises ``FileNotFoundError`` -- it is never an empty
+    corpus, and there is no JSONL fallback.
+    """
+    try:
+        import scope_corpus as SC  # noqa: PLC0415 - shared resolver
+    except Exception as exc:  # noqa: BLE001
+        raise FileNotFoundError(
+            "scope_corpus is unavailable; the corpus database path cannot be "
+            f"resolved ({type(exc).__name__}: {exc})"
+        ) from exc
+    path = SC.resolve_db_path(None, db_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"corpus database not found: {path}; build it with "
+            "tools/build_runtime_corpus.py"
+        )
+    return path
 
 
-def _read_jsonl(path: Path) -> tuple[list[dict], int, int]:
-    """Return (records, physical_line_count, parse_error_count)."""
-    raw = path.read_bytes()
-    text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    records: list[dict] = []
-    errors = 0
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            errors += 1
-            continue
-        if isinstance(rec, dict):
-            records.append(rec)
-        else:
-            errors += 1
-    return records, len(lines), errors
+def _corpus_manifest_entry(meta: Mapping[str, Any], corpus_sha: str) -> dict:
+    """Relate the stored methods file to ``corpus/manifest.json``.
+
+    Both sides come from the database's build-time snapshot (``meta``): the
+    manifest text the build recorded and the per-source sha256 it computed. The
+    runtime never re-reads either file, so an edit on disk cannot change the
+    answer, and a build made without a manifest reports ``absent``.
+
+    Provenance only: a missing, unreadable or non-matching manifest does not
+    block the registry, it is reported.
+    """
+    manifest = meta.get("corpus_manifest")
+    out: dict[str, Any] = {
+        "status": "absent",
+        "path": None,
+        "schema": None,
+        "generated_utc": None,
+        "file_entry": None,
+        "sha256_match": None,
+        "patterns": None,
+        "error": None,
+        "source": "corpus_database",
+    }
+    if not isinstance(manifest, Mapping):
+        return out
+    files = manifest.get("files")
+    entry = files.get("methods.jsonl") if isinstance(files, Mapping) else None
+    patterns = manifest.get("patterns")
+    out.update({
+        "status": "ok",
+        "schema": manifest.get("schema"),
+        "generated_utc": manifest.get("generated_utc"),
+        "file_entry": dict(entry) if isinstance(entry, Mapping) else None,
+        "patterns": dict(patterns) if isinstance(patterns, Mapping) else None,
+    })
+    if out["schema"] != CORPUS_MANIFEST_SCHEMA:
+        out["status"] = "schema_mismatch"
+    if isinstance(entry, Mapping):
+        out["sha256_match"] = entry.get("sha256") == corpus_sha
+        if not out["sha256_match"]:
+            out["status"] = "sha256_mismatch"
+    elif isinstance(files, Mapping):
+        out["status"] = "file_not_listed"
+    return out
 
 
 def resolve_pmid_list(pmid_list_path: str | os.PathLike | None = None) -> Path:
@@ -459,14 +443,17 @@ class MethodRegistry:
 
     def __init__(
         self,
-        methods_path: str | os.PathLike | None = None,
+        db_path: str | os.PathLike | None = None,
         pmid_list_path: str | os.PathLike | None = None,
         retractions: Iterable[Any] | None = None,
         executable: Mapping[str, Mapping] | None = None,
     ) -> None:
-        self.methods_path = Path(methods_path) if methods_path is not None else METHODS_PATH
-        if not self.methods_path.is_file():
-            raise FileNotFoundError(f"methods corpus not found: {self.methods_path}")
+        self.db_path = resolve_db_path(db_path)
+        if not self.db_path.is_file():
+            raise FileNotFoundError(
+                f"corpus database not found: {self.db_path}; build it with "
+                "tools/build_runtime_corpus.py"
+            )
         self.pmid_list_path = resolve_pmid_list(pmid_list_path)
         self._executable_override = dict(executable) if executable is not None else None
         self._retractions = _retraction_registry(retractions)
@@ -486,10 +473,65 @@ class MethodRegistry:
     def _executable(self) -> dict:
         return _load_executable(self._executable_override)
 
+    def _corpus_rows(self) -> tuple[list[dict], dict]:
+        """Projected method records and the database metadata.
+
+        The runtime never parses ``research/corpus/methods.jsonl``: the database
+        built from it is the only source. Rows arrive as the whitelisted
+        projection plus the columns the record layer used to read off the raw
+        line (``pmid``, ``record_uid``, ``in_scope``), so every filter below
+        keeps its old meaning.
+        """
+        try:
+            import scope_corpus as SC  # noqa: PLC0415 - shared reader module
+        except Exception as exc:  # noqa: BLE001
+            raise FileNotFoundError(
+                "scope_corpus is unavailable; the method registry reads "
+                f"corpus/records.sqlite through it ({type(exc).__name__}: {exc})"
+            ) from exc
+        conn = SC.open_db(self.db_path)
+        try:
+            meta = SC.read_meta(conn)
+            rows: list[dict] = []
+            uids: dict[str, str] = {}
+            for row in SC.iter_record_rows(conn, source_kind="method"):
+                record = dict(row["record_payload"])
+                record["pmid"] = row["pmid"]
+                # ``in_scope`` inside the payload is the extraction's own
+                # record-layer verdict and must survive; the database column of
+                # the same name only records the PMID list the build used.
+                record.setdefault("in_scope", None)
+                record["_db_in_scope"] = row["in_scope"]
+                uid = str(row["record_uid"])
+                record["_record_uid"] = uid
+                record["_retracted_ref"] = row["retracted_ref"]
+                uids[uid] = row["pmid"]
+                rows.append(record)
+            # Live retraction parity: a row that mentions a PMID in the
+            # configured registry is dropped even though the build that stored
+            # it only knew the registry frozen at build time.
+            mentioned = SC.pmids_mentioning(
+                conn, sorted(self._retractions.pmids), owner="record"
+            )
+        finally:
+            conn.close()
+        meta = dict(meta)
+        meta["_uids"] = uids
+        meta["_mentioned_uids"] = {uid for uid in mentioned if uid in uids}
+        return rows, meta
+
     def _build(self) -> None:
-        raw = self.methods_path.read_bytes()
-        corpus_sha = _sha256(raw)
-        records, n_lines, parse_errors = _read_jsonl(self.methods_path)
+        records, db_meta = self._corpus_rows()
+        source_files = db_meta.get("source_files") or {}
+        corpus_sha = str(source_files.get("methods.jsonl") or "")
+        sources = {
+            str(entry.get("label") or entry.get("kind")): entry
+            for entry in (db_meta.get("sources") or ())
+            if isinstance(entry, dict)
+        }
+        method_source = sources.get("methods") or {}
+        n_lines = int(method_source.get("n_lines") or 0)
+        excluded_kind = (db_meta.get("excluded_by_kind") or {}).get("method") or {}
 
         scope_list = read_pmid_list(self.pmid_list_path)
         list_sha = scope_list["sha256"]
@@ -503,12 +545,15 @@ class MethodRegistry:
         excluded_pmids: dict[str, set[str]] = {}
         n_records_in_scope = 0
 
+        mentioned_uids = set(db_meta.get("_mentioned_uids") or ())
         for rec in records:
             pmid = str(rec.get("pmid") or "").strip()
             if not pmid:
                 reason = "missing_pmid"
             elif pmid in retracted:
                 reason = "retracted"
+            elif rec["_retracted_ref"] or str(rec.get("_record_uid") or "") in mentioned_uids:
+                reason = "retracted_reference"
             elif pmid not in included_set:
                 reason = "pmid_not_in_included_list"
             elif rec.get("in_scope") is not True:
@@ -742,18 +787,30 @@ class MethodRegistry:
         )
 
         self._corpus = {
-            "path": str(self.methods_path),
+            # Provenance of the JSONL the database was built from: the hash is
+            # the build-time digest recorded in ``sources``, not a re-read of a
+            # file that the runtime never opens.
+            "path": str(method_source.get("path") or ""),
             "sha256": corpus_sha,
             "sha256_16": corpus_sha[:16],
-            "bytes": len(raw),
+            "bytes": None,
             "n_lines": n_lines,
             "n_records_parsed": len(records),
-            "n_parse_errors": parse_errors,
+            "n_parse_errors": int(excluded_kind.get("n_malformed") or 0),
             "n_records_raw": len(records),
             "n_records_in_scope": n_records_in_scope,
             "n_records_after_scope": n_qualifying,
             "n_records_qualifying": n_qualifying,
-            "manifest": _corpus_manifest_entry(self.methods_path, corpus_sha),
+            "manifest": _corpus_manifest_entry(db_meta, corpus_sha),
+            "database": {
+                "path": str(self.db_path),
+                "schema_id": db_meta.get("schema_id"),
+                "schema_version": db_meta.get("schema_version"),
+                "generator": db_meta.get("generator"),
+                "built_utc": db_meta.get("built_utc"),
+                "corpus_fingerprint": db_meta.get("corpus_fingerprint"),
+                "build_excluded": excluded_kind,
+            },
         }
 
         self._scope = {
@@ -786,6 +843,19 @@ class MethodRegistry:
             }
             for reason, count in sorted(excluded_counts.items())
         }
+        # Build-time drops that the database already applied and that this
+        # registry therefore never sees: reported so the accounting stays
+        # complete instead of silently shrinking.
+        for reason in ("retracted_records", "unattributed_records",
+                       "malformed_records", "out_of_scope_records"):
+            block = excluded_kind.get(reason)
+            if isinstance(block, dict) and int(block.get("records") or 0):
+                self._excluded.setdefault(reason, {
+                    "records": int(block.get("records") or 0),
+                    "n_pmids": len(block.get("pmids") or ()),
+                    "pmids": _pmid_list(block.get("pmids") or ()),
+                    "applied_at": "build",
+                })
 
         self._counts = {
             "n_records_total": len(records),
@@ -809,9 +879,9 @@ class MethodRegistry:
         }
 
         self._notes = [
-            "Corpus extraction is known incomplete: methods.jsonl is a frozen "
-            "extraction, not an exhaustive inventory. Absence is not evidence "
-            "that a method was unused.",
+            "Corpus extraction is known incomplete: the methods rows are a "
+            "frozen extraction, not an exhaustive inventory. Absence is not "
+            "evidence that a method was unused.",
             "No frequency threshold or top-N cut is applied. Every qualifying "
             "canonical name is listed, including single-paper long-tail methods.",
             "Normalization merges only case/punctuation/whitespace surface "
@@ -1608,14 +1678,14 @@ def _default_registry() -> MethodRegistry:
 
 
 def build_registry(
-    methods_path: str | os.PathLike | None = None,
+    db_path: str | os.PathLike | None = None,
     pmid_list_path: str | os.PathLike | None = None,
     retractions: Iterable[Any] | None = None,
     executable: Mapping[str, Mapping] | None = None,
 ) -> MethodRegistry:
-    """Build a registry from an explicit snapshot (tests, alternate corpora)."""
+    """Build a registry from an explicit database (tests, alternate corpora)."""
     return MethodRegistry(
-        methods_path=methods_path,
+        db_path=db_path,
         pmid_list_path=pmid_list_path,
         retractions=retractions,
         executable=executable,

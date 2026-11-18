@@ -124,6 +124,8 @@ def main() -> int:
 
     research_dir = config.get("research_dir") or None
     pmid_list_path = config.get("pmid_list_path") or None
+    # The database location is configuration, not a request field: the caller
+    # exports SCOPE_CORPUS_DB and the reader resolves it against research_dir.
     try:
         index = ScopeKnowledge(
             research_dir=research_dir,

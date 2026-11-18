@@ -7,3 +7,7 @@ node_modules/
 .env
 .env.*
 dist/
+/research/
+*.jsonl
+*.ndjson
+included_pmids_*.txt

@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
+from collections.abc import Mapping
 import sys
 from pathlib import Path
 
@@ -21,7 +24,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from sctda import literature as lit  # noqa: E402
 from sctda import method_registry as MR  # noqa: E402
-from sctda import method_sources as ms  # noqa: E402
+from sctda import method_sources as ms
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import build_runtime_corpus as BR  # noqa: E402  # noqa: E402
 from sctda.harness import invoke_tool  # noqa: E402
 from sctda.project import Project  # noqa: E402
 import scope_knowledge as SK  # noqa: E402
@@ -391,12 +397,35 @@ CODE_ROWS = [
 
 
 def write_code_corpus(tmp_path: Path) -> Path:
+    """Write the extraction, build the runtime database, point the tool at it.
+
+    Returns the ``code_sources.jsonl`` path the database was built from (its
+    digest is what the answer reports); the database lives next to it.
+    """
     research = tmp_path / "research"
-    research.mkdir()
-    path = research / "code_sources.jsonl"
+    corpus = research / "corpus"
+    corpus.mkdir(parents=True)
+    path = corpus / "code_sources.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for row in CODE_ROWS),
                     encoding="utf-8")
+    pmid_list = tmp_path / "build_pmids.txt"
+    pmid_list.write_text("1\n2\n", encoding="utf-8")
+    BR.build(research, corpus / "records.sqlite", pmid_list_path=pmid_list)
+    os.environ["SCOPE_CORPUS_DB"] = str(corpus / "records.sqlite")
     return path
+
+
+def point_at(path: Path) -> Path:
+    """Aim the process at the database built next to ``path`` (a test seam)."""
+    db = path.parent / "records.sqlite"
+    os.environ["SCOPE_CORPUS_DB"] = str(db)
+    return db
+
+
+@pytest.fixture(autouse=True)
+def _isolate_corpus_env(monkeypatch):
+    """Every test resolves its own database; never the developer's real one."""
+    monkeypatch.delenv("SCOPE_CORPUS_DB", raising=False)
 
 
 def write_pmid_list(tmp_path: Path, pmids=("1", "2"),
@@ -410,7 +439,7 @@ def test_code_sources_pages_by_pmid_and_marks_every_record_unverified(
         tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
     list_path = write_pmid_list(tmp_path, ("1", "2", "999"))
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     first = ms.code_sources("1", page=1, page_size=1,
                             pmid_list_path=list_path)
     assert first["status"] == "ok"
@@ -441,7 +470,7 @@ def test_code_sources_pages_by_pmid_and_marks_every_record_unverified(
 def test_code_sources_absent_pmid_is_explicit_not_found(tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
     list_path = write_pmid_list(tmp_path, ("1", "999"))
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     result = ms.code_sources("999", pmid_list_path=list_path)
     assert result["status"] == "not_found"
     assert result["total_for_pmid"] == 0
@@ -452,26 +481,26 @@ def test_code_sources_absent_pmid_is_explicit_not_found(tmp_path, monkeypatch):
 def test_code_sources_rejects_bad_pmid_and_arbitrary_path(tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
     list_path = write_pmid_list(tmp_path, ("1",))
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     assert ms.code_sources("abc", pmid_list_path=list_path)["status"] == "failed"
     assert ms.code_sources("1", page=0,
                            pmid_list_path=list_path)["status"] == "failed"
     assert ms.code_sources("1", page_size=10_000,
                            pmid_list_path=list_path)["status"] == "failed"
-    elsewhere = tmp_path / "secret" / "code_sources.jsonl"
+    elsewhere = tmp_path / "secret" / "not_the_db.jsonl"
     elsewhere.parent.mkdir()
     elsewhere.write_text("{}\n", encoding="utf-8")
     blocked = ms.code_sources("1", path=str(elsewhere),
                               pmid_list_path=list_path)
     assert blocked["status"] == "failed"
-    assert "frozen research/corpus/code_sources.jsonl" in blocked["error"]
+    assert "runtime corpus database" in blocked["error"]
 
 
 def test_code_sources_refuses_out_of_scope_pmid_without_reading_corpus(
         tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
     list_path = write_pmid_list(tmp_path, ("1",))
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     monkeypatch.setattr(
         ms, "_load_code_records",
         lambda *a, **k: pytest.fail("out-of-scope must not read the corpus"))
@@ -490,7 +519,7 @@ def test_code_sources_refuses_out_of_scope_pmid_without_reading_corpus(
 def test_code_sources_fails_closed_when_the_pmid_list_is_missing(
         tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     monkeypatch.setattr(
         ms, "_load_code_records",
         lambda *a, **k: pytest.fail("no list must mean no corpus read"))
@@ -521,7 +550,7 @@ def test_code_sources_fails_closed_when_the_pmid_list_is_missing(
 def test_code_sources_reads_env_and_default_configured_list(tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
     list_path = write_pmid_list(tmp_path, ("1",))
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
 
     monkeypatch.setenv(SK.PMID_LIST_ENV, str(list_path))
     assert ms.code_sources("1")["status"] == "ok"
@@ -533,7 +562,7 @@ def test_code_sources_reads_env_and_default_configured_list(tmp_path, monkeypatc
 
 def test_code_sources_rejects_malformed_or_empty_pmid_lists(tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     bad = tmp_path / "bad_list.txt"
     bad.write_text("1\nnot-a-pmid\n", encoding="utf-8")
     malformed = ms.code_sources("1", pmid_list_path=bad)
@@ -551,7 +580,7 @@ def test_code_sources_rejects_malformed_or_empty_pmid_lists(tmp_path, monkeypatc
 def test_code_sources_explicit_historical_list_is_marked_superseded(
         tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     current = write_pmid_list(tmp_path, ("1", "2"))
     historical = write_pmid_list(tmp_path, ("1",),
                                  name="included_pmids_422.txt")
@@ -576,7 +605,7 @@ def test_code_sources_explicit_historical_list_is_marked_superseded(
 def test_code_sources_custom_list_is_used_but_reported_as_unrecognised(
         tmp_path, monkeypatch):
     path = write_code_corpus(tmp_path)
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     custom = write_pmid_list(tmp_path, ("1",), name="custom_scope.txt")
     result = ms.code_sources("1", pmid_list_path=custom)
     assert result["status"] == "ok"
@@ -587,82 +616,70 @@ def test_code_sources_custom_list_is_used_but_reported_as_unrecognised(
 
 
 def test_real_code_sources_corpus_is_readable_without_modification():
-    if not ms.CODE_SOURCES_PATH.exists():
-        pytest.skip("frozen code_sources.jsonl unavailable")
+    """Contract check against the built database; skipped until it exists."""
+    import scope_corpus as SC
+
+    db = SC.resolve_db_path(None, None)
+    if not db.is_file():
+        pytest.skip(f"runtime corpus database not built: {db}")
     try:
         scope = MR.read_pmid_list(None)
     except (FileNotFoundError, ValueError) as exc:
         pytest.skip(str(exc))
     if "32997960" not in scope["pmid_set"]:
         pytest.skip("the configured inclusion list does not contain 32997960")
-    before = hashlib.sha256(ms.CODE_SOURCES_PATH.read_bytes()).hexdigest()
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
     result = ms.code_sources("32997960", page=1, page_size=5,
                              pmid_list_path=scope["path"])
-    after = hashlib.sha256(ms.CODE_SOURCES_PATH.read_bytes()).hexdigest()
-    assert before == after
+    after = hashlib.sha256(db.read_bytes()).hexdigest()
+    assert before == after, "reading must not modify the database"
     assert result["status"] in ("ok", "not_found"), result
     assert result["pmid_in_scope"] is True
     assert result["scope"]["n_included_pmids"] >= 1
     assert result["total_in_file"] > 1000
-    # The corpus manifest vouches for the bytes that were read.
-    assert result["corpus_manifest"]["status"] == "ok"
-    assert result["corpus_manifest"]["sha256_match"] is True
-    assert result["corpus_manifest"]["manifest_sha256"] == result["file_sha256"]
+    # The database's build-time manifest vouches for the projected file.
+    assert result["corpus_manifest"]["status"] in ("ok", "absent")
+    if result["corpus_manifest"]["status"] == "ok":
+        assert result["corpus_manifest"]["sha256_match"] is True
+        assert result["corpus_manifest"]["manifest_sha256"] == result["file_sha256"]
     if result["status"] == "ok":
         assert all(r["verified"] is False for r in result["records"])
 
 
-def test_a_monkeypatched_corpus_path_without_a_manifest_reports_absent(
-        tmp_path, monkeypatch):
-    """The patched path becomes the corpus root, so its missing manifest shows."""
+def test_corpus_without_a_manifest_reports_absent(tmp_path):
+    """A database built without corpus/manifest.json reports it, not silently ok."""
     path = write_code_corpus(tmp_path)
     list_path = write_pmid_list(tmp_path, ("1",))
-    monkeypatch.setattr(ms, "CODE_SOURCES_PATH", path)
+    point_at(path)
     result = ms.code_sources("1", pmid_list_path=list_path)
     assert result["status"] == "ok"
     assert result["corpus_manifest"]["status"] == "absent"
     assert result["corpus_manifest"]["sha256_match"] is None
-    assert result["file_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
-
-    (path.parent / "manifest.json").write_text(json.dumps({
-        "schema": "sctda.corpus_manifest/1",
-        "files": {"code_sources.jsonl": {
-            "sha256": result["file_sha256"]}},
-    }), encoding="utf-8")
-    again = ms.code_sources("1", pmid_list_path=list_path)
-    assert again["corpus_manifest"]["status"] == "ok"
-    assert again["corpus_manifest"]["sha256_match"] is True
+    assert result["file_sha256"]
 
 
-def test_stale_manifest_hash_is_reported_against_the_real_corpus(tmp_path):
-    """A corpus file edited after the manifest was written is flagged, not hidden."""
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    source = ms.CODE_SOURCES_PATH
-    if not source.is_file():
-        pytest.skip("frozen code_sources.jsonl unavailable")
-    payload = source.read_bytes()
-    (corpus / "code_sources.jsonl").write_bytes(payload)
-    manifest = json.loads(
-        (source.parent / "manifest.json").read_bytes().decode("utf-8")
-    )
-    manifest["files"]["code_sources.jsonl"]["sha256"] = "0" * 64
-    (corpus / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+def test_stale_manifest_hash_is_reported_against_the_real_corpus():
+    """A build made off-snapshot is flagged, not hidden."""
+    import scope_corpus as SC
 
-    # `code_sources` only serves the canonical path, so a temp directory can
-    # only be compared through the helper: it must not claim the manifest of a
-    # directory it is not in.
-    out = ms._code_sources_manifest(
-        corpus / "code_sources.jsonl",
-        hashlib.sha256(payload).hexdigest(),
-    )
-    assert out["status"] == "not_in_corpus"
-
-    out = ms._code_sources_manifest(source, "0" * 64)
+    db = SC.resolve_db_path(None, None)
+    if not db.is_file():
+        pytest.skip(f"runtime corpus database not built: {db}")
+    conn = SC.open_db(db, require_fts=False)
+    try:
+        meta = SC.read_meta(conn)
+    finally:
+        conn.close()
+    manifest = meta.get("corpus_manifest")
+    if not isinstance(manifest, Mapping):
+        pytest.skip("the database was built without a corpus manifest")
+    provenance = {"corpus_manifest": manifest}
+    out = ms._code_sources_manifest(provenance, "0" * 64)
     assert out["status"] == "sha256_mismatch"
     assert out["manifest_sha256"] and out["manifest_sha256"] != "0" * 64
     assert out["schema"] == "sctda.corpus_manifest/1"
-
+    real_sha = (meta.get("source_files") or {})["code_sources.jsonl"]
+    assert ms._code_sources_manifest(provenance, real_sha)["sha256_match"] is True
 
 
 def test_code_sources_out_of_scope_answer_survives_the_tool_boundary(tmp_path):

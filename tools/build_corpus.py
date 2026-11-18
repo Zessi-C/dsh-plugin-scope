@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Build the formal run-time corpus under ``research/corpus/``.
+"""Build the development snapshots used to compile the SQLite corpus.
 
-The official inputs of a run are the four files in ``research/corpus`` plus the
-manifest that proves where every byte came from. Build history stays on disk:
-nothing under ``research/`` is deleted or rewritten, so the pre-merge shards,
-the repair passes and the merged-at-root files all remain readable as
-provenance.
+Keep the byte-identical copies, merged patterns, and complete lineage under
+``research/corpus/`` in development. The original shards, repair passes and
+merged-at-root files stay in place for audit. This command does not produce
+or validate the deployable SQLite database.
 
 What is produced
 ----------------
@@ -17,12 +16,10 @@ What is produced
     destructive rewrite.
 ``research/corpus/patterns.jsonl``
     One record per PMID, merged from ``scope_learn/shard_*.jsonl`` and
-    ``scope_learn/repair_*.jsonl`` under the existing ``prefer_repairs=True``
-    semantics: a repair record replaces the shard record for the same PMID, and
-    the shard record is indexed only if the caller asked for ``prefer_repairs=
-    False``. Each output line is the exact bytes of the record it came from, so
-    repair traces (``prior_status``, ``remaining_obstacles``, ``repair`` ...)
-    survive verbatim; which line superseded which is recorded in
+    ``scope_learn/repair_*.jsonl``. A repair record replaces the shard record
+    for the same PMID. Each output line preserves the exact source bytes,
+    including repair traces (``prior_status``, ``remaining_obstacles``,
+    ``repair`` ...). Which line superseded which is recorded in
     ``provenance/patterns_records.jsonl`` instead of being annotated into the
     record.
 ``research/corpus/provenance/patterns_records.jsonl``
@@ -37,10 +34,9 @@ What is produced
 
 Rules the merge follows, deliberately
 -------------------------------------
-* Nothing is dropped for being retracted or out of scope. Retraction-registry
-  exclusion and the 405/422 PMID scope are *read-time* decisions and stay in the
-  reader; baking them in would make the corpus a different object than the one
-  the recorded numbers were computed from.
+* Nothing is dropped for being retracted or out of scope. These snapshots
+  preserve the full development extraction; runtime lookups apply the
+  configured scope and retraction registry.
 * Ordering is deterministic: shard files in numeric-suffix order, each in line
   order, and a superseded shard record is replaced in place by its repair
   record. Rebuilding therefore reproduces the same bytes, and each record's row
@@ -55,9 +51,8 @@ Usage
     python3 tools/build_corpus.py --write    # write research/corpus
     python3 tools/build_corpus.py --check    # rebuild in memory and diff on disk
     python3 tools/build_corpus.py --verify-equivalence
-                                            # replay the merge rule and, when the
-                                            # reader still offers the split
-                                            # layout, cross-check every hit
+                                            # replay the merge rule against
+                                            # the on-disk patterns snapshot
 
 ``SOURCE_DATE_EPOCH`` pins ``generated_utc`` so a rebuild is byte-identical.
 ``--check`` exits non-zero on drift, ``--verify-equivalence`` on a mismatch, so
@@ -474,27 +469,10 @@ def build(research: Path) -> dict[str, bytes]:
                 "shard files by numeric suffix, each in line order; a superseded "
                 "shard record is replaced in place by its repair record"
             ),
-            "equivalent_to": (
-                "the reader's prefer_repairs=True path over "
-                "scope_learn/shard_*.jsonl + repair_*.jsonl: same 422 records, "
-                "same record bytes, same pattern-unit count"
+            "verification_rule": (
+                "--verify-equivalence independently replays repair-over-shard "
+                "selection and compares the on-disk pattern record bytes"
             ),
-            "differs_from_legacy_reader_in": [
-                "record_id/evidence_id now name this file ('patterns:...:rowN') "
-                "instead of the shard file stem; hit seq order therefore differs "
-                "wherever the shard file order did",
-                "a hit's source_file/source_sha256 name this file, not the shard",
-                "stats.excluded.superseded_records is 0: superseded shard "
-                "records are not in the input any more, so the reader has "
-                "nothing to drop. The count survives as "
-                "patterns.superseded_records (24, of which 1 is the retracted "
-                "PMID); the old reader reported 23 there because it dropped that "
-                "record as retracted before it could count it as superseded",
-                "stats.excluded.retracted_records goes 24 -> 23: the old layout "
-                "held both shard_6 and repair_a for PMID 36450980, so it excluded "
-                "two pattern records; the merged file holds one. No retrievable "
-                "hit changed (--verify-equivalence compares all hit signatures)",
-            ],
             "read_time_only": [
                 "retraction registry exclusion",
                 "PMID scope filter (405 current, 422 historical)",
@@ -515,8 +493,7 @@ def build(research: Path) -> dict[str, bytes]:
         },
         "scope_lists": scope_lists(),
         "lineage": {
-            "note": "build history stays on disk; this directory adds the formal "
-                    "inputs and never replaces or deletes what came before",
+            "note": "development build inputs and lineage; do not deploy or publish",
             "retained_in_place": [
                 "methods.jsonl / workflows.jsonl / code_sources.jsonl at the "
                 "research root: the merge target the extraction shards fed",
@@ -531,7 +508,7 @@ def build(research: Path) -> dict[str, bytes]:
                     "edits to this file, carry the corrected reading"
                 ),
             },
-            "formal_inputs": [
+            "sqlite_build_inputs": [
                 "corpus/methods.jsonl",
                 "corpus/workflows.jsonl",
                 "corpus/code_sources.jsonl",
@@ -571,46 +548,11 @@ def build(research: Path) -> dict[str, bytes]:
     return payloads
 
 
-# ---------------------------------------------------------- reader equivalence
-
-
-def _hit_signature(hit) -> tuple:
-    """Everything a retrieval result exposes about one hit, minus the label.
-
-    ``record_id``/``source_file``/``source_sha256`` are deliberately excluded:
-    the merge renames the pattern source, and this check exists to prove the
-    *retrievable content* did not move when that happened.
-    """
-    return (
-        hit.pmid,
-        hit.source_kind,
-        hit.granularity,
-        hit.locator,
-        hit.verbatim,
-        hit.in_scope,
-        tuple((k, json.dumps(v, ensure_ascii=False, sort_keys=True, default=str))
-              for k, v in hit.content),
-        tuple((k, json.dumps(v, ensure_ascii=False, sort_keys=True, default=str))
-              for k, v in hit.record_context),
-        tuple(sorted(hit.field_tiers)),
-    )
-
-
 def verify_equivalence(research: Path) -> dict:
-    """Prove the merged corpus is the ``prefer_repairs=True`` view, without a reader.
+    """Independently replay shard/repair selection against merged pattern bytes.
 
-    Two independent layers:
-
-    1. **Selector replay** — re-derive the merged file from the shard/repair
-       files with the documented rule and compare bytes. This is the check that
-       survives reader refactors, because it only uses the source files.
-    2. **Reader cross-check** — if ``src/scope_knowledge.py`` still exposes the
-       two layouts, compare every hit signature. Reported as ``null`` when the
-       reader no longer offers the pre-merge layout, because a deleted code path
-       is not evidence about the data.
-
-    A third layer is cheap and decisive for the copies: ``bytes`` identity, which
-    ``--check`` already enforces.
+    ``--check`` separately verifies the other development snapshots. The
+    SQLite builder and runtime queries are checked independently.
     """
     learn = research / "scope_learn"
     shard_paths = sorted(learn.glob(SHARD_GLOB), key=shard_sort_key)
@@ -643,60 +585,12 @@ def verify_equivalence(research: Path) -> dict:
             "rule": "for each shard record in file order, substitute the repair "
                     "record with the same pmid when one exists",
         },
-        "reader_cross_check": None,
     }
     if not report["selector_replay"]["identical"]:
         first = next((i for i, (a, b) in enumerate(zip(replayed, merged_bytes)) if a != b),
                      min(len(replayed), len(merged_bytes)))
         report["selector_replay"]["first_divergence_row"] = first + 1
     report["equivalent"] = report["selector_replay"]["identical"]
-
-    try:
-        sys.path.insert(0, str(research.parent / "src"))
-        import scope_knowledge as sk
-
-        legacy = sk.ScopeKnowledge(research_dir=str(research))
-        merged = sk.ScopeKnowledge(
-            research_dir=str(research / "corpus"),
-            source_files=[
-                ("workflow", "workflows.jsonl", "workflows"),
-                ("method", "methods.jsonl", "methods"),
-                ("pattern", PATTERNS, "patterns"),
-            ],
-        )
-        legacy_stats, merged_stats = legacy.stats(), merged.stats()
-        left = sorted(_hit_signature(h) for h in legacy._all_hits)
-        right = sorted(_hit_signature(h) for h in merged._all_hits)
-        report["reader_cross_check"] = {
-            "legacy_sources": [(s["label"], s["n_records_indexed"], s["n_hits"])
-                               for s in legacy_stats["sources"]],
-            "merged_sources": [(s["label"], s["n_records_indexed"], s["n_hits"])
-                               for s in merged_stats["sources"]],
-            "n_records_indexed": [legacy_stats["n_records_indexed"],
-                                  merged_stats["n_records_indexed"]],
-            "n_hits_indexed": [legacy_stats["n_hits_indexed"],
-                               merged_stats["n_hits_indexed"]],
-            "n_hits_anchored": [legacy_stats["n_hits_anchored"],
-                                merged_stats["n_hits_anchored"]],
-            "coverage_equal": legacy_stats["coverage"] == merged_stats["coverage"],
-            "identical_hit_multiset": left == right,
-            "legacy_excluded": legacy_stats["excluded"],
-            "merged_excluded": merged_stats["excluded"],
-            "equivalent": (
-                left == right
-                and legacy_stats["n_hits_indexed"] == merged_stats["n_hits_indexed"]
-                and legacy_stats["n_hits_anchored"] == merged_stats["n_hits_anchored"]
-                and legacy_stats["coverage"] == merged_stats["coverage"]
-            ),
-        }
-        report["equivalent"] = report["equivalent"] and report["reader_cross_check"]["equivalent"]
-    except Exception as exc:  # noqa: BLE001 - the reader may be mid-refactor
-        report["reader_cross_check"] = {
-            "skipped": True,
-            "reason": f"{type(exc).__name__}: {exc}",
-            "note": "the pre-merge reader layout is unavailable; selector replay "
-                    "still proves the merge rule, and --check proves the copies",
-        }
     return report
 
 
@@ -710,9 +604,8 @@ def main() -> int:
     ap.add_argument("--check", action="store_true",
                     help="recompute and compare against the corpus on disk")
     ap.add_argument("--verify-equivalence", action="store_true",
-                    help="replay the merge rule against the source shards and, "
-                         "when the reader still offers the split layout, compare "
-                         "every hit signature")
+                    help="compare the on-disk patterns snapshot with an independent "
+                         "replay of shard/repair selection")
     args = ap.parse_args()
 
     research = Path(args.research_dir).expanduser().resolve()
@@ -759,13 +652,16 @@ def main() -> int:
                 mismatches.append(f"differs:{name}")
         extra = sorted(p.relative_to(corpus_dir).as_posix()
                        for p in corpus_dir.rglob("*")
-                       if p.is_file() and p.relative_to(corpus_dir).as_posix() not in payloads)
+                       if p.is_file() and p.relative_to(corpus_dir).as_posix()
+                       not in payloads.keys() | {"records.sqlite"})
         if extra:
             mismatches.append("unexpected:" + ",".join(extra))
         report["check"] = {"status": "ok" if not mismatches else "drift",
                            "mismatches": mismatches}
+        if args.verify_equivalence:
+            report["equivalence"] = verify_equivalence(research)
         print(json.dumps(report, ensure_ascii=False, indent=1))
-        return 0 if not mismatches else 1
+        return int(bool(mismatches) or not report.get("equivalence", {}).get("equivalent", True))
 
     if args.verify_equivalence:
         report["equivalence"] = verify_equivalence(research)

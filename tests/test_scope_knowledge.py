@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import scope_knowledge as SK  # noqa: E402
 import build_corpus as BC  # noqa: E402
+import build_runtime_corpus as BR  # noqa: E402
 
 PMID = "11111111"
 SHARD_ONLY = "33333333"
@@ -425,15 +426,15 @@ def write_corpus(
     shards: list[dict] | None = None,
     repairs: list[dict] | None = None,
     included: tuple[str, ...] = (PMID, RETRACTED, SHARD_ONLY),
-) -> tuple[Path, list[SK.SourceSpec], Path]:
-    """Write extraction inputs, then build the corpus the reader actually reads.
+) -> tuple[Path, Path, Path]:
+    """Write extraction inputs, build the corpus, then build the runtime DB.
 
     The split layout (root JSONL files plus ``scope_learn/shard_*``/``repair_*``)
     is only a *build input*: ``tools/build_corpus.build`` copies the three root
-    files and merges the shard/repair pattern records with the same
-    repair-over-shard precedence the reader used to apply at query time.
-    ``source_files`` is returned explicitly so these tests keep exercising the
-    injection path rather than the shipped corpus.
+    files and merges the shard/repair pattern records with the
+    repair-over-shard precedence; ``tools/build_runtime_corpus.build`` then
+    projects those files into ``corpus/records.sqlite``, which is the only thing
+    the reader opens. Returns ``(research, db_path, pmid_list)``.
     """
     research = root / "research"
     learn = research / "scope_learn"
@@ -466,11 +467,9 @@ def write_corpus(
 
     pmid_list = root / "included_pmids_405.txt"
     pmid_list.write_text("\n".join(included) + "\n", encoding="utf-8")
-    specs = [
-        SK.SourceSpec(kind, corpus / name, label)
-        for kind, name, label in SK.CORPUS_FILES
-    ]
-    return research, specs, pmid_list
+    db_path = corpus / "records.sqlite"
+    BR.build(research, db_path, pmid_list_path=pmid_list)
+    return research, db_path, pmid_list
 
 
 def make_index(
@@ -483,7 +482,9 @@ def make_index(
     included: tuple[str, ...] = (PMID, RETRACTED, SHARD_ONLY),
     extra_retractions=(),
 ) -> SK.ScopeKnowledge:
-    research, specs, pmid_list = write_corpus(
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    research, db_path, pmid_list = write_corpus(
         root,
         workflows=workflows,
         methods=methods,
@@ -494,7 +495,7 @@ def make_index(
     return SK.ScopeKnowledge(
         research_dir=research,
         pmid_list_path=pmid_list,
-        source_files=specs,
+        db_path=db_path,
         extra_retractions=extra_retractions,
     )
 
@@ -528,9 +529,55 @@ def test_retraction_survives_missing_pmid_field(index):
 
 
 def test_record_mentioning_retracted_pmid_is_excluded(index):
+    """A mention of a retracted PMID is never served, and is accounted for.
+
+    The fixture's raw-mention workflow has no attributable PMID, so the build
+    drops it as ``unattributed`` before it can be stored; the accounting below
+    is what explains the empty answer.
+    """
     page = index.search("RAW_REFERENCE_TOKEN", limit=50)
     assert page["hits"] == []
-    assert index.stats()["excluded"]["retracted_reference_records"] >= 1
+    excluded = index.stats()["excluded"]
+    assert excluded["unattributed_records"] >= 1
+
+
+def test_stored_record_mentioning_a_retracted_pmid_is_dropped_by_the_live_gate(
+        tmp_path):
+    """The reference gate covers rows stored by a build that predates the notice.
+
+    The row below belongs to an in-scope, non-retracted PMID, so nothing drops
+    it at build time; only the ``pmid_refs`` reference index (built from the raw
+    JSON, including fields the projection discards) can hide it.
+    """
+    workflow = {
+        "workflow_id": "mention:wf1",
+        "pmid": PMID,
+        "question": {
+            "text": "Mention question",
+            "evidence": [
+                {
+                    "locator": "results:L1:P1:S1",
+                    "verbatim": "STORED_MENTION_TOKEN compares with PMID 36450980.",
+                }
+            ],
+        },
+        "comparison": "none",
+        "cell_level": "none",
+        "steps": [],
+        "claims": [],
+        "gaps": [],
+        "author_focus_groups": [],
+        "no_prior_warning": "",
+    }
+    index = make_index(tmp_path, workflows=[workflow])
+
+    assert index.search("STORED_MENTION_TOKEN", limit=50)["hits"] == []
+    stats = index.stats()
+    assert stats["excluded"]["retracted_reference_records"] == 1
+    # The owning paper is itself in scope and not retracted: the drop is the
+    # reference gate, not the own-PMID retraction rule.
+    assert PMID not in index.retractions
+    assert index.record(PMID)["status"] == "ok"
 
 
 def test_retraction_registry_is_extensible_and_append_only(tmp_path):
@@ -584,38 +631,15 @@ def test_pmid_list_is_authoritative(index):
 
 
 def test_missing_pmid_list_fails_closed(tmp_path, monkeypatch):
-    research, specs, _ = write_corpus(tmp_path)
+    research, db_path, _ = write_corpus(tmp_path)
     monkeypatch.setattr(
         SK, "DEFAULT_PMID_LIST_CANDIDATES", (tmp_path / "absent.txt",)
     )
     monkeypatch.delenv(SK.PMID_LIST_ENV, raising=False)
 
-    index = SK.ScopeKnowledge(research_dir=research, source_files=specs)
+    index = SK.ScopeKnowledge(research_dir=research, db_path=db_path)
     with pytest.raises(SK.CorpusConfigError):
         index.build()
-
-
-def test_missing_pmid_list_can_be_explicitly_unfiltered(tmp_path, monkeypatch):
-    research, specs, _ = write_corpus(tmp_path)
-    monkeypatch.setattr(
-        SK, "DEFAULT_PMID_LIST_CANDIDATES", (tmp_path / "absent.txt",)
-    )
-    monkeypatch.delenv(SK.PMID_LIST_ENV, raising=False)
-
-    index = SK.ScopeKnowledge(
-        research_dir=research,
-        source_files=specs,
-        allow_missing_pmid_list=True,
-    )
-    stats = index.build()
-    assert stats["pmid_list"]["scope_mode"] == "unfiltered"
-    assert stats["pmid_list"]["n_pmids"] == 0
-
-    # Retraction still wins when the scope list is unavailable.
-    assert index.search("RETRACTED_UNIQUE_TOKEN", limit=50)["hits"] == []
-    page = index.search("decreased after treatment", granularities="step")
-    assert page["hits"]
-    assert page["hits"][0]["in_scope"] is None
 
 
 # ----------------------------------------------------------------------- tiers
@@ -1003,13 +1027,15 @@ def test_only_one_pattern_record_per_pmid_is_indexed(index):
 
 
 def test_manifest_hash_mismatch_is_reported_not_hidden(tmp_path):
-    research, specs, pmid_list = write_corpus(tmp_path)
+    """A database built from an off-snapshot file still serves, with a warning."""
+    research, db_path, pmid_list = write_corpus(tmp_path)
     drop_last_record(research / "corpus" / "patterns.jsonl")
+    BR.build(research, db_path, pmid_list_path=pmid_list)
 
     index = SK.ScopeKnowledge(
         research_dir=research,
         pmid_list_path=pmid_list,
-        source_files=specs,
+        db_path=db_path,
     )
     stats = index.build()
 
@@ -1028,13 +1054,14 @@ def test_manifest_hash_mismatch_is_reported_not_hidden(tmp_path):
 
 
 def test_corpus_without_manifest_is_reported(tmp_path):
-    research, specs, pmid_list = write_corpus(tmp_path)
+    research, db_path, pmid_list = write_corpus(tmp_path)
     (research / "corpus" / "manifest.json").unlink()
+    BR.build(research, db_path, pmid_list_path=pmid_list)
 
     index = SK.ScopeKnowledge(
         research_dir=research,
         pmid_list_path=pmid_list,
-        source_files=specs,
+        db_path=db_path,
     )
     stats = index.build()
 
@@ -1046,38 +1073,38 @@ def test_corpus_without_manifest_is_reported(tmp_path):
     assert stats["n_hits_indexed"] > 0
 
 
-def test_manifest_from_another_directory_is_not_claimed(tmp_path):
-    """A test corpus must not inherit the shipped manifest's hashes."""
-    research, specs, pmid_list = write_corpus(tmp_path)
+def test_manifest_provenance_comes_from_the_database_not_the_directory(tmp_path):
+    """The reader reports the manifest recorded at build time, never a re-read.
+
+    Editing ``corpus/manifest.json`` after the build cannot change an answer:
+    provenance is part of the database, and the sources' own hashes are what
+    ``manifest_status`` compares against.
+    """
+    research, db_path, pmid_list = write_corpus(tmp_path)
     manifest_path = research / "corpus" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    recorded_sha = manifest["files"]["patterns.jsonl"]["sha256"]
     manifest["files"]["patterns.jsonl"]["sha256"] = "0" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    # Same corpus, but the source specs point at the files outside the corpus
-    # directory this manifest describes.
-    detached = tmp_path / "detached"
-    detached.mkdir()
-    moved = []
-    for kind, name, label in SK.CORPUS_FILES:
-        payload = (research / "corpus" / name).read_bytes()
-        (detached / name).write_bytes(payload)
-        moved.append(SK.SourceSpec(kind, detached / name, label))
-
     index = SK.ScopeKnowledge(
-        research_dir=tmp_path / "other-research",
+        research_dir=research,
         pmid_list_path=pmid_list,
-        source_files=moved,
+        db_path=db_path,
     )
     stats = index.build()
-    assert stats["corpus_manifest"]["status"] == "absent"
+    assert stats["corpus_manifest"]["status"] == "ok"
+    assert (
+        stats["corpus_manifest"]["files"]["patterns.jsonl"]["sha256"]
+        == recorded_sha
+    )
     assert all(
-        source["manifest_status"] == "not_listed" for source in stats["sources"]
+        source["manifest_status"] == "match" for source in stats["sources"]
     )
 
 
 def test_build_is_read_only(tmp_path):
-    research, specs, pmid_list = write_corpus(tmp_path)
+    research, db_path, pmid_list = write_corpus(tmp_path)
     corpus = research / "corpus"
     paths = [
         corpus / "workflows.jsonl",
@@ -1095,7 +1122,7 @@ def test_build_is_read_only(tmp_path):
     index = SK.ScopeKnowledge(
         research_dir=research,
         pmid_list_path=pmid_list,
-        source_files=specs,
+        db_path=db_path,
     )
     index.build()
     after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
@@ -1103,15 +1130,16 @@ def test_build_is_read_only(tmp_path):
 
 
 def test_malformed_line_is_reported_not_indexed(tmp_path):
-    research, specs, pmid_list = write_corpus(tmp_path)
+    research, db_path, pmid_list = write_corpus(tmp_path)
     workflows_path = research / "corpus" / "workflows.jsonl"
     with workflows_path.open("a", encoding="utf-8") as handle:
         handle.write("{this is not json}\n")
+    BR.build(research, db_path, pmid_list_path=pmid_list)
 
     index = SK.ScopeKnowledge(
         research_dir=research,
         pmid_list_path=pmid_list,
-        source_files=specs,
+        db_path=db_path,
     )
     stats = index.build()
     assert stats["excluded"]["malformed_records"] >= 1
@@ -1131,15 +1159,15 @@ def test_corpus_fingerprint_is_stable_across_rebuilds(index):
 
 
 REAL_RESEARCH = ROOT / "research"
+REAL_DB = REAL_RESEARCH / "corpus" / "records.sqlite"
 REAL_PMID_LIST = Path(
     "/data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt"
 )
 
 
 @pytest.mark.skipif(
-    not (REAL_RESEARCH / "corpus" / "workflows.jsonl").is_file()
-    or not REAL_PMID_LIST.is_file(),
-    reason="built corpus or 405-PMID inclusion list unavailable",
+    not REAL_DB.is_file() or not REAL_PMID_LIST.is_file(),
+    reason="built runtime database or 405-PMID inclusion list unavailable",
 )
 def test_real_frozen_corpus_contract():
     index = SK.ScopeKnowledge(
@@ -1147,6 +1175,7 @@ def test_real_frozen_corpus_contract():
         pmid_list_path=REAL_PMID_LIST,
     )
     stats = index.build()
+    assert stats["backend"] == "sqlite_fts5"
     assert stats["pmid_list"]["n_pmids"] == 405
     assert stats["n_hits_indexed"] > 10_000
     assert stats["excluded"]["retracted_records"] >= 1
@@ -1155,7 +1184,7 @@ def test_real_frozen_corpus_contract():
     labels = {source["label"] for source in stats["sources"]}
     assert labels == {"workflows", "methods", "patterns"}
     assert stats["corpus_manifest"]["status"] == "ok"
-    assert stats["corpus_manifest"]["n_sources_covered"] == 3
+    assert stats["corpus_manifest"]["n_sources_covered"] == 4  # Includes author code.
     assert all(
         source["manifest_status"] == "match" for source in stats["sources"]
     )

@@ -7,11 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from sctda import method_registry as MR
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+
+import build_runtime_corpus as BR  # noqa: E402
 
 
 # ------------------------------------------------------------------- fixtures
@@ -42,19 +48,34 @@ def _record(pmid: str, name: str, **overrides) -> dict:
 
 
 def _build(tmp_path, records, pmids, retractions=None, executable=None):
-    methods = tmp_path / "methods.jsonl"
-    methods.write_text(
+    """Write the extraction as build inputs, then build the runtime database.
+
+    ``records`` go to the *extraction* file (``research/methods.jsonl``), the
+    build merges it into ``research/corpus/methods.jsonl``, and
+    ``build_runtime_corpus`` projects that into ``corpus/records.sqlite`` --
+    the only artifact the registry reads. The returned second value is the
+    database path, not a JSONL file.
+    """
+    research = tmp_path / "research"
+    corpus = research / "corpus"
+    corpus.mkdir(parents=True, exist_ok=True)
+    # Write the *built* corpus layout directly: the merge that produces it is
+    # covered by tools/build_corpus.py's own tests, and this suite is about the
+    # registry's record layer.
+    (corpus / "methods.jsonl").write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
         encoding="utf-8",
     )
-    pmid_list = tmp_path / "included_pmids_405.txt"
-    pmid_list.write_text("\n".join(pmids) + "\n", encoding="utf-8")
+    pmids_root = tmp_path / "included_pmids_405.txt"
+    pmids_root.write_text("\n".join(pmids) + "\n", encoding="utf-8")
+    db_path = corpus / "records.sqlite"
+    BR.build(research, db_path, pmid_list_path=pmids_root)
     return MR.build_registry(
-        methods_path=methods,
-        pmid_list_path=pmid_list,
+        db_path=db_path,
+        pmid_list_path=pmids_root,
         retractions=retractions,
         executable=executable if executable is not None else {},
-    ), methods, pmid_list
+    ), db_path, pmids_root
 
 
 def _names(page: dict) -> list[str]:
@@ -90,8 +111,7 @@ def test_scope_filter_retraction_and_exclusion_accounting(tmp_path):
     assert stats["scope"]["pmids_without_qualifying_records"] == ["333", "444"]
 
     excluded = stats["counts"]["records_excluded"]
-    assert excluded["retracted"]["records"] == 1
-    assert excluded["retracted"]["pmids"] == ["222"]
+    assert excluded["retracted"]["pmids"] == ["222"]  # Notice supplied only at read time.
     assert excluded["not_in_scope"]["records"] == 1
     assert excluded["not_computational"]["records"] == 1
     assert excluded["pmid_not_in_included_list"]["records"] == 1
@@ -135,7 +155,8 @@ def test_upstream_background_is_preserved_not_filtered(tmp_path):
                 instance_id="111:methods:L1:P1:S1", locator="methods:L1:P1:S1"),
         _record("111", "BackgroundTool", rerunnable_role="rerunnable",
                 instance_id="111:methods:L2:P1:S1", locator="methods:L2:P1:S1"),
-        _record("111", "PureBackground", rerunnable_role="upstream_background"),
+        _record("111", "PureBackground", rerunnable_role="upstream_background",
+                instance_id="111:methods:L3:P1:S1", locator="methods:L3:P1:S1"),
     ]
     reg, _, _ = _build(tmp_path, records, ["111"])
 
@@ -371,7 +392,7 @@ def test_evidence_provenance_and_corpus_hashes(tmp_path):
         _record("112", "NoVerbatimTool"),
     ]
     records[1]["verbatim"] = None
-    reg, methods_path, pmid_path = _build(tmp_path, records, ["111", "112"])
+    reg, db_path, pmid_path = _build(tmp_path, records, ["111", "112"])
 
     page = reg.search("ProvenanceTool")
     method = page["methods"][0]
@@ -400,7 +421,12 @@ def test_evidence_provenance_and_corpus_hashes(tmp_path):
     assert missing["has_verbatim"] is False
 
     stats = reg.stats()
-    assert stats["corpus"]["sha256"] == hashlib.sha256(methods_path.read_bytes()).hexdigest()
+    # The hash is the build-time digest of the methods file the database was
+    # built from (recorded by the build), not a re-read of a file on disk.
+    built_methods = tmp_path / "research" / "corpus" / "methods.jsonl"
+    assert stats["corpus"]["sha256"] == hashlib.sha256(
+        built_methods.read_bytes()).hexdigest()
+    assert stats["corpus"]["database"]["path"] == str(db_path)
     assert stats["corpus"]["n_records_parsed"] == 2
     assert stats["pmid_list"]["sha256"] == hashlib.sha256(pmid_path.read_bytes()).hexdigest()
     assert stats["pmid_list"]["n_pmids"] == 2
@@ -595,17 +621,21 @@ def test_real_corpus_scope_and_retraction(real_registry):
     assert stats["scope"]["n_effective_pmids"] == 404
     assert stats["corpus"]["sha256"]
     assert stats["corpus"]["n_parse_errors"] == 0
-    # The methods file read is the one the corpus manifest describes.
+    # The manifest describes the input snapshot, not the projected rows.
     manifest = stats["corpus"]["manifest"]
     assert manifest["status"] == "ok"
     assert manifest["sha256_match"] is True
-    assert manifest["file_entry"]["n_records"] == stats["corpus"]["n_records_parsed"]
+    build_excluded = stats["corpus"]["database"]["build_excluded"]
+    removed = sum(build_excluded[key]["records"] for key in (
+        "retracted_records", "unattributed_records", "superseded_records",
+    ))
+    assert manifest["file_entry"]["n_records"] == stats["corpus"]["n_records_parsed"] + removed
     assert manifest["patterns"]["superseded_records"] == 24
     assert Path(stats["corpus"]["path"]).parent.name == "corpus"
 
     all_pmids = {p for m in real_registry.load()["methods"] for p in m["pmids"]}
     assert "36450980" not in all_pmids
-    assert stats["counts"]["records_excluded"]["retracted"]["records"] > 0
+    assert "36450980" in build_excluded["retracted_records"]["pmids"]
 
 
 def test_real_corpus_four_adapter_mappings(real_registry):

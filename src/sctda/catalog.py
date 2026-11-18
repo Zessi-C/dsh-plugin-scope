@@ -9,7 +9,7 @@ Three layers are kept deliberately separate, because the design requires it:
                   hard-excluded. A discovered method never implies support.
   - REGISTRY    : ``method_registry`` owns the corpus index and the explicit
                   adapter-to-instance mapping. Catalog delegates to it instead
-                  of re-scanning ``research/corpus/methods.jsonl`` or guessing matches.
+                  of re-scanning the corpus database or guessing matches.
 
 ``catalog_summary`` reports both layers separately and pages the discovered
 layer by default, so one tool call cannot return the whole multi-megabyte

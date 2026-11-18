@@ -249,3 +249,16 @@ test('a cap below the default page size lowers the default too', async () => {
   await search.execute({}, {})
   assert.deepEqual(calls[0], { limit: 10, offset: 0 })
 })
+
+test('the bridge environment carries the configured research root and database', async () => {
+  const run = scriptedRun({ knowledge: { search: { stdout: '{"status":"ok"}' } } })
+  await callKnowledge({
+    config: { ...CONFIG, corpusDbPath: '/db/records.sqlite', researchDir: '/research/root' },
+    operation: 'search',
+    args: {},
+    run,
+  })
+  const env = run.calls[0].options.env
+  assert.equal(env.SCOPE_RESEARCH_DIR, '/research/root')
+  assert.equal(env.SCOPE_CORPUS_DB, '/db/records.sqlite')
+})

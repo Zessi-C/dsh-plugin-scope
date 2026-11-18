@@ -210,3 +210,25 @@ test('an inherited SCTDA_R_TIMEOUT_SECONDS is dropped when the deployment has no
   const tight = kernelEnv('/k', base, 30000)
   assert.equal('SCTDA_R_TIMEOUT_SECONDS' in tight, false)
 })
+
+test('the corpus database path is forwarded only when one is configured', async () => {
+  const { applyCorpusDbEnv } = await import('../lib/manifest.js')
+  // An unset knob must leave the inherited environment alone: a release install
+  // may keep records.sqlite outside the research tree and export the variable.
+  assert.deepEqual(applyCorpusDbEnv({ PATH: '/bin' }, ''), { PATH: '/bin' })
+  assert.deepEqual(
+    applyCorpusDbEnv({ PATH: '/bin', SCOPE_CORPUS_DB: '/x/records.sqlite' }, ''),
+    { PATH: '/bin', SCOPE_CORPUS_DB: '/x/records.sqlite' },
+  )
+  assert.deepEqual(
+    applyCorpusDbEnv({ PATH: '/bin' }, '/y/records.sqlite'),
+    { PATH: '/bin', SCOPE_CORPUS_DB: '/y/records.sqlite' },
+  )
+  // A configured path wins over an inherited value.
+  assert.deepEqual(
+    applyCorpusDbEnv({ SCOPE_CORPUS_DB: '/old.sqlite' }, '/new.sqlite'),
+    { SCOPE_CORPUS_DB: '/new.sqlite' },
+  )
+  // Absent knob, absent variable: nothing is invented.
+  assert.equal('SCOPE_CORPUS_DB' in applyCorpusDbEnv({}, undefined), false)
+})

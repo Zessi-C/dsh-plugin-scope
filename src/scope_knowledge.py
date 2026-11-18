@@ -7,43 +7,48 @@ to the corpus.
 
 What it reads
 -------------
-The corpus lives in ``<research>/corpus`` and is produced by
-``tools/build_corpus.py``; the extraction shards under ``research/shards`` and
-``research/scope_learn`` are build inputs retained for audit, never read here.
+``<research>/corpus/records.sqlite``
+    The runtime database built by ``tools/build_runtime_corpus.py`` from the
+    frozen extraction under ``research/corpus`` (itself produced by
+    ``tools/build_corpus.py``). It holds one row per extraction record - a
+    whitelisted *projection*, never the raw JSONL line - precomputed evidence
+    units, an FTS5 trigram index over their normalised search text, the frozen
+    retraction and editorial-notice registries, and the build provenance
+    (per-source sha256/line/record counts, the configured PMID list, the corpus
+    manifest, row digests).
 
-``<research>/corpus/workflows.jsonl``
-    One record per paper: question, comparison, cell level, ordered steps
-    (observation -> next analysis -> rationale), claims and gaps.
-``<research>/corpus/methods.jsonl``
-    One record per method instance with locator, verbatim sentence, operation,
-    stage and stated constraints.
-``<research>/corpus/patterns.jsonl``
-    One pattern record per PMID with a brief locator or a PDF page anchor.
-    The shard -> repair precedence is already applied when the file is built, so
-    this module indexes exactly one record per paper and does no precedence
-    selection. ``manifest.json`` records which source files were merged and how
-    many records a repair superseded; that provenance is reported in ``stats``.
-``<research>/corpus/manifest.json``
-    Per-file sha256, byte size, record count and source files, plus the pattern
-    merge provenance. Every source's sha256 is checked against it; a mismatch is
-    a warning, never silently ignored.
+    Path resolution: ``db_path`` argument > ``SCOPE_CORPUS_DB`` >
+    ``<research>/corpus/records.sqlite``; ``<research>`` itself comes from
+    ``research_dir`` > ``SCOPE_RESEARCH_DIR`` > the repository default.
+
+There is **no JSONL fallback**. ``research/corpus/*.jsonl`` are build inputs for
+the developer tools only: the runtime never parses them, never rebuilds the
+database, and never treats a missing/unbuildable database as an empty corpus.
+A missing file, a schema mismatch or a SQLite without FTS5 is a hard
+``CorpusConfigError`` that names the path and the builder.
+
+Retrieval itself is SQL: the structural filters (source kind, granularity,
+anchor, PMID set, scope, retraction) narrow rows in SQLite, and free text is
+first narrowed by the trigram FTS5 index. The token-boundary matcher and the
+tier assignment then run over those candidates, so ``UC`` still cannot match
+``AUCell`` and a phrase still cannot be satisfied by two different fields.
 
 Hard rules
 ----------
 1. The user's 405-PMID inclusion list is authoritative (the current upstream
    set; ``included_pmids_422.txt`` is a superseded snapshot kept only for
    reproducing pre-2026-11-13 numbers). If the list cannot be read, construction
-   fails closed unless ``allow_missing_pmid_list=True`` is passed explicitly for
-   an audit. Records whose PMID is not in the list are dropped.
-   ``include_out_of_scope=True`` is likewise an audit-only escape hatch; it
-   never overrides the retraction rule.
+   fails closed. Records whose PMID is not in the list are dropped. The database's
+   own ``in_scope`` column records the list it was built with and is not a gate;
+   a different configured list is reported with ``corpus_db_scope_mismatch``.
 2. Retracted papers are hard-excluded before any search. PMID 36450980 is in
    the default registry; the registry can grow through ``extra_retractions``
-   but cannot be emptied. Exclusion also applies when the ``pmid`` field is
-   missing: the PMID is recovered from record IDs, and as a last resort the
-   raw record is scanned for a retracted PMID. A record that merely mentions a
-   retracted PMID is also dropped, because this frozen corpus is not a citation
-   graph and a conservative miss is safer than surfacing a retracted fragment.
+   but cannot be emptied. Exclusion applies at build time (records whose own
+   PMID is retracted are never stored) and again at query time (the live
+   registry filters every row). A record that merely mentions a retracted PMID
+   anywhere in its raw JSON is also dropped, because this frozen corpus is not a
+   citation graph and a conservative miss is safer than surfacing a retracted
+   fragment; the builder flags those rows rather than discarding them silently.
 3. A hit is one fine-grained evidence unit, never a paper-level summary. It
    carries source file + SHA-256, PMID, locator, and verbatim text, or it is
    labelled ``unverified`` and hidden by default. ``rationale``, ``next_analysis``,
@@ -82,14 +87,17 @@ Typical use
                        matched_fields=hit["matched_fields"])
     full = idx.record(hit["pmid"])            # whole frozen extract for one paper
 
-    # Tests index a hand-built corpus instead of the shipped one:
+    # Tests build a throwaway database from synthetic JSONL fixtures:
+    #     tools.build_runtime_corpus.build(research, db)
     idx = ScopeKnowledge(research_dir=root,
-                         source_files=[SourceSpec("pattern", path, "patterns")])
+                         pmid_list_path=pmid_list,
+                         db_path=root / "records.sqlite")
 """
 from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -102,6 +110,8 @@ from typing import Any
 
 __all__ = [
     "CorpusConfigError",
+    "DB_ENV",
+    "DB_NAME",
     "DEFAULT_EDITORIAL_NOTICES",
     "DEFAULT_RETRACTIONS",
     "EditorialNotice",
@@ -121,6 +131,7 @@ __all__ = [
     "TIER_VERBATIM",
     "corpus_dir",
     "default_index",
+    "derive_record_hits",
     "locator_section",
     "make_pdf_locator",
     "normalize_pmid",
@@ -168,18 +179,25 @@ MAX_WARNINGS = 200
 
 PMID_LIST_ENV = "SCOPE_INCLUDED_PMIDS"
 RESEARCH_DIR_ENV = "SCOPE_RESEARCH_DIR"
+#: Runtime database, resolved by :mod:`scope_corpus` (db_path > this > default).
+DB_ENV = "SCOPE_CORPUS_DB"
+DB_NAME = "records.sqlite"
 DEFAULT_RESEARCH_DIR = Path(__file__).resolve().parent.parent / "research"
 CORPUS_SUBDIR = "corpus"
 CORPUS_MANIFEST_NAME = "manifest.json"
 CORPUS_SCHEMA = "sctda.corpus_manifest/1"
-# The three extraction copies plus the merged pattern file. Names are the
-# contract with ``tools/build_corpus.py``; nothing globs this directory, so a
-# stray file cannot enter the index by accident.
+# Source order of the database rows. ``seq`` is assigned in this order, and
+# ``record()`` pages in it, so results are byte-identical to the former JSONL
+# index. Names are the development filenames; only ``record()`` provenance and
+# stats use them now - no runtime path reads these files.
 CORPUS_FILES = (
     ("workflow", "workflows.jsonl", "workflows"),
     ("method", "methods.jsonl", "methods"),
     ("pattern", "patterns.jsonl", "patterns"),
 )
+#: Table name in the runtime schema, kept here so error messages can name it.
+DB_TABLE_RECORDS = "records"
+DB_TABLE_HITS = "hits"
 DEFAULT_PMID_LIST_CANDIDATES = (
     # Only the current inclusion set is a default candidate. The superseded 422
     # list is deliberately not a fallback: a missing current list fails closed
@@ -343,6 +361,9 @@ def _as_int(value: Any) -> int | None:
     return None
 
 
+PMID_DIGITS = r"\d{1,9}"
+
+
 def normalize_pmid(value: Any) -> str | None:
     """Return a bare PMID string, or ``None`` when the value is not one."""
     if value is None or isinstance(value, bool):
@@ -353,7 +374,7 @@ def normalize_pmid(value: Any) -> str | None:
         value = int(value)
     text = str(value).strip()
     text = re.sub(r"^PMID\s*:?\s*", "", text, flags=re.IGNORECASE)
-    if re.fullmatch(r"\d{1,9}", text):
+    if re.fullmatch(PMID_DIGITS, text):
         return text
     return None
 
@@ -766,6 +787,13 @@ class EditorialNoticeRegistry:
 
 @dataclass(frozen=True)
 class SourceSpec:
+    """One extraction source's identity: kind, development file and label.
+
+    The runtime no longer opens ``path``; ``kind``/``label`` still appear in
+    provenance and are what :meth:`ScopeKnowledge._record_id` uses. The builder
+    (``tools/build_runtime_corpus.py``) is the only code that reads the file.
+    """
+
     kind: str
     path: Path
     label: str
@@ -901,15 +929,20 @@ class KnowledgeHit:
 
 
 class ScopeKnowledge:
-    """Read-only retrieval over the frozen SCOPE corpus."""
+    """Read-only retrieval over the frozen SCOPE corpus database.
+
+    The corpus is a SQLite artifact built by
+    ``tools/build_runtime_corpus.py`` and read through :mod:`scope_corpus`.
+    There is no JSONL fallback: a missing, schema-mismatched or FTS-less
+    database is a hard configuration error, never an empty corpus.
+    """
 
     def __init__(
         self,
         research_dir: str | Path | None = None,
         *,
+        db_path: str | Path | None = None,
         pmid_list_path: str | Path | None = None,
-        source_files: Sequence[SourceSpec | Path | str | tuple] | None = None,
-        allow_missing_pmid_list: bool = False,
         expected_pmid_list_sha256: str | None = None,
         extra_retractions: Iterable[RetractionNotice | Mapping[str, Any]] = (),
         retractions: RetractionRegistry | None = None,
@@ -917,23 +950,21 @@ class ScopeKnowledge:
             EditorialNotice | Mapping[str, Any]
         ] = (),
         editorial_notices: EditorialNoticeRegistry | None = None,
-        include_out_of_scope: bool = False,
     ) -> None:
         self.research_dir = Path(
             research_dir
             if research_dir is not None
             else (os.environ.get(RESEARCH_DIR_ENV) or DEFAULT_RESEARCH_DIR)
         ).expanduser()
+        self.db_path = Path(db_path).expanduser() if db_path is not None else None
         self.pmid_list_path = (
             Path(pmid_list_path).expanduser() if pmid_list_path is not None else None
         )
-        self.allow_missing_pmid_list = bool(allow_missing_pmid_list)
         self.expected_pmid_list_sha256 = (
             expected_pmid_list_sha256.lower()
             if expected_pmid_list_sha256
             else None
         )
-        self.include_out_of_scope = bool(include_out_of_scope)
         self.retractions = (
             retractions
             if retractions is not None
@@ -950,32 +981,54 @@ class ScopeKnowledge:
         if editorial_notices is not None:
             for item in extra_editorial_notices:
                 self.editorial_notices.add(item)
-        self._specs = (
-            self._coerce_sources(source_files)
-            if source_files is not None
-            else _default_source_specs(self.research_dir)
-        )
-        self._manifest = _read_corpus_manifest(
-            self.research_dir, self._specs
-        )
+        self._corpus: Any = None
+        self._conn: Any = None
+        self._hit_row_params: tuple[str, ...] | None = None
         self._lock = threading.RLock()
         self._reset()
 
     # ---------------------------------------------------------------- lifecycle
 
     def _reset(self) -> None:
+        if getattr(self, "_conn", None) is not None:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001 - closing a read-only handle
+                pass
+        self._conn = None
         self._built = False
         self._stats: dict[str, Any] = {}
         self._scope: dict[str, Any] = {}
-        self._all_hits: list[KnowledgeHit] = []
-        self._hits_by_id: dict[str, KnowledgeHit] = {}
-        self._hits_by_record: dict[str, list[KnowledgeHit]] = {}
-        self._records_by_pmid: dict[str, list[dict]] = {}
-        self._records_by_uid: dict[str, dict] = {}
+        self._db_block: dict[str, Any] = {}
+        self._manifest: dict[str, Any] = {}
         self._field_names: set[str] = set()
+        self._included: set[str] = set()
+        self._mentioned_uids: set[str] = set()
+
+    def close(self) -> None:
+        """Close the read-only database handle (idempotent)."""
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+                    self._built = False
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __enter__(self) -> "ScopeKnowledge":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
     def build(self, force: bool = False) -> dict:
-        """Build the index and return :meth:`stats`."""
+        """Open the database and return :meth:`stats`."""
         if force:
             with self._lock:
                 self._reset()
@@ -993,40 +1046,22 @@ class ScopeKnowledge:
 
     # ------------------------------------------------------------ configuration
 
-    def _coerce_sources(
-        self, source_files: Sequence[SourceSpec | Path | str | tuple]
-    ) -> list[SourceSpec]:
-        specs: list[SourceSpec] = []
-        for item in source_files:
-            if isinstance(item, SourceSpec):
-                spec = item
-            elif isinstance(item, (str, Path)):
-                path = Path(item).expanduser()
-                spec = SourceSpec(_infer_source_kind(path), path, path.stem)
-            elif isinstance(item, tuple):
-                if len(item) == 2:
-                    kind, path = item
-                    label = Path(path).stem
-                elif len(item) == 3:
-                    kind, path, label = item
-                else:
-                    raise CorpusConfigError(
-                        "source_files tuple must be (kind, path[, label])"
-                    )
-                spec = SourceSpec(kind, Path(path), str(label))
-            else:
-                raise CorpusConfigError(f"unsupported source spec: {item!r}")
-            if spec.kind not in SOURCE_KINDS:
+    def _corpus_module(self) -> Any:
+        module = self._corpus
+        if module is None:
+            try:
+                import scope_corpus as module  # noqa: PLC0415 - shared reader module
+            except Exception as exc:  # noqa: BLE001
                 raise CorpusConfigError(
-                    f"unknown source kind {spec.kind!r}; allowed {list(SOURCE_KINDS)}"
-                )
-            path = spec.path
-            if not path.is_absolute():
-                path = self.research_dir / path
-            specs.append(SourceSpec(spec.kind, path, spec.label))
-        if not specs:
-            raise CorpusConfigError("source_files is empty; nothing to index")
-        return specs
+                    "scope_corpus is unavailable; the SCOPE runtime reads "
+                    f"corpus/records.sqlite through it ({type(exc).__name__}: {exc})"
+                ) from exc
+            self._corpus = module
+        return module
+
+    def resolved_db_path(self) -> Path:
+        """Path the runtime opens: ``db_path`` > ``SCOPE_CORPUS_DB`` > default."""
+        return self._corpus_module().resolve_db_path(self.research_dir, self.db_path)
 
     # ------------------------------------------------------------------ building
 
@@ -1040,227 +1075,233 @@ class ScopeKnowledge:
             if len(warnings) < MAX_WARNINGS:
                 warnings.append(message)
 
+        module = self._corpus_module()
         scope = self._load_scope(warn)
-        specs = self._specs
-        source_stats = [
-            {
-                "kind": spec.kind,
-                "label": spec.label,
-                "path": str(spec.path),
-                "status": "missing",
-                "sha256": None,
-                "manifest_status": "unknown",
-                "manifest_sha256": None,
-                "manifest_n_records": None,
-                "n_lines": 0,
-                "n_records": 0,
-                "n_malformed": 0,
-                "n_records_indexed": 0,
-                "n_hits": 0,
-            }
-            for spec in specs
-        ]
-        entries: list[dict[str, Any]] = []
+        path = module.resolve_db_path(self.research_dir, self.db_path)
+        try:
+            conn = module.open_db(path)
+        except module.CorpusDbError as exc:
+            raise CorpusConfigError(str(exc)) from exc
+        try:
+            meta = module.read_meta(conn)
+            field_names = module.field_names(conn)
+            mentioned_uids = module.pmids_mentioning(conn, self.retractions.pmids)
+        except module.CorpusDbError as exc:
+            conn.close()
+            raise CorpusConfigError(str(exc)) from exc
+        self._conn = conn
+        self._stats = {}
+        self._db_block = {}
+        self._included = set(scope.get("pmids_set") or ())
+        self._mentioned_uids = mentioned_uids
+        self._field_names = set(field_names)
+        self._scope = scope
+        self._manifest = _manifest_block(meta, self.research_dir, warn)
+        db_sources = {
+            str(entry.get("label") or entry.get("kind") or entry.get("file")): entry
+            for entry in (meta.get("sources") or ())
+            if isinstance(entry, Mapping)
+        }
 
-        for spec_index, spec in enumerate(specs):
-            stat = source_stats[spec_index]
-            if not spec.path.is_file():
-                warn(f"source_missing:{spec.label}:{spec.path}")
-                continue
-            try:
-                data = spec.path.read_bytes()
-            except OSError as exc:
-                warn(f"source_unreadable:{spec.label}:{exc}")
-                continue
-            stat["status"] = "ok"
-            stat["sha256"] = _sha256_bytes(data)
-            manifest_entry = _manifest_entry_for(
-                self._manifest, self.research_dir, spec
+        source_stats: list[dict[str, Any]] = []
+        for kind, name, label in CORPUS_FILES:
+            entry = db_sources.get(label) or db_sources.get(kind) or {}
+            record_where, record_params = self._indexed_where(
+                extra="source_kind = ?", extra_params=[kind]
             )
-            if manifest_entry is None:
-                stat["manifest_status"] = "not_listed"
-                if self._manifest.get("status") == "ok":
-                    warn(f"corpus_manifest_missing_file:{spec.label}:{spec.path.name}")
-            else:
-                stat["manifest_status"] = (
-                    "match" if manifest_entry.get("sha256") == stat["sha256"]
-                    else "sha256_mismatch"
-                )
-                stat["manifest_sha256"] = manifest_entry.get("sha256")
-                stat["manifest_n_records"] = manifest_entry.get("n_records")
-                if stat["manifest_status"] == "sha256_mismatch":
-                    # A rebuilt corpus is legitimate; a silently edited one is
-                    # not. The index still serves the bytes it read, but the
-                    # answer says they are not the manifest's snapshot.
-                    warn(
-                        "corpus_file_hash_differs_from_manifest:"
-                        f"{spec.label}:{spec.path.name}:"
-                        f"manifest={manifest_entry.get('sha256')}:"
-                        f"actual={stat['sha256']}"
+            n_records_indexed = self._scalar(
+                f"SELECT COUNT(*) FROM {DB_TABLE_RECORDS} WHERE {record_where}",
+                record_params,
+            )
+            hit_where, hit_params = self._indexed_where(
+                extra="records.source_kind = ?", extra_params=[kind]
+            )
+            n_hits = self._scalar(
+                f"SELECT COUNT(*) FROM {DB_TABLE_HITS} JOIN {DB_TABLE_RECORDS} "
+                f"ON {DB_TABLE_RECORDS}.record_uid = {DB_TABLE_HITS}.record_uid "
+                f"WHERE {hit_where}",
+                hit_params,
+            )
+            stat = {
+                "kind": kind,
+                "label": label,
+                "path": entry.get("path"),
+                "status": entry.get("status", "missing"),
+                "sha256": entry.get("sha256"),
+                "manifest_status": entry.get("manifest_status", "unknown"),
+                "manifest_sha256": entry.get("manifest_sha256"),
+                "manifest_n_records": (
+                    ((self._manifest.get("files") or {}).get(name) or {}).get(
+                        "n_records"
                     )
-            text = data.decode("utf-8-sig", errors="replace")
-            lines = text.splitlines()
-            stat["n_lines"] = len(lines)
-            row = 0
-            for line_number, line in enumerate(lines, 1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    record = json.loads(stripped)
-                except json.JSONDecodeError as exc:
-                    stat["n_malformed"] += 1
-                    warn(f"malformed_json:{spec.label}:L{line_number}:{exc.msg}")
-                    continue
-                if not isinstance(record, dict):
-                    stat["n_malformed"] += 1
-                    warn(f"non_object_json:{spec.label}:L{line_number}")
-                    continue
-                row += 1
-                stat["n_records"] += 1
-                entries.append(
-                    {
-                        "spec": spec,
-                        "spec_index": spec_index,
-                        "row": row,
-                        "record": record,
-                        "source_file": self._display_path(spec.path),
-                        "source_sha256": stat["sha256"],
-                    }
+                ),
+                "n_lines": entry.get("n_lines", 0),
+                "n_records": entry.get("n_records", 0),
+                "n_malformed": entry.get("n_malformed", 0),
+                "n_records_indexed": n_records_indexed,
+                "n_hits": n_hits,
+            }
+            if stat["status"] != "ok":
+                warn(f"source_missing:{label}:{stat['path']}")
+            if stat["n_malformed"]:
+                warn(
+                    f"malformed_json:{label}:{stat['n_malformed']} line(s) were "
+                    "not indexed by the build"
                 )
+            if stat["manifest_status"] == "sha256_mismatch":
+                warn(
+                    "corpus_file_hash_differs_from_manifest:"
+                    f"{label}:{name}:manifest={stat['manifest_sha256']}:"
+                    f"actual={stat['sha256']}"
+                )
+            elif (
+                stat["manifest_status"] == "not_listed"
+                and self._manifest.get("status") == "ok"
+            ):
+                warn(f"corpus_manifest_missing_file:{label}:{name}")
+            source_stats.append(stat)
 
-        retraction_res = [
-            (pmid, re.compile(rf"(?<!\d){re.escape(pmid)}(?!\d)"))
-            for pmid in sorted(self.retractions.pmids)
-        ]
-        included_pmids = set(scope.get("pmids_set") or ())
+        db_pmid_list = (
+            meta.get("pmid_list") if isinstance(meta.get("pmid_list"), Mapping) else {}
+        )
+        if (
+            scope["mode"] == "included"
+            and db_pmid_list.get("sha256")
+            and db_pmid_list.get("sha256") != scope.get("sha256")
+        ):
+            warn(
+                "corpus_db_scope_mismatch:"
+                f"db={db_pmid_list.get('sha256')}:configured={scope.get('sha256')}; "
+                "retrieval follows the configured list, not the build-time list"
+            )
+
+        record_where, record_params = self._indexed_where()
+        hit_where, hit_params = self._indexed_where()
+        n_records_indexed = self._scalar(
+            f"SELECT COUNT(*) FROM {DB_TABLE_RECORDS} WHERE {record_where}",
+            record_params,
+        )
+        n_hits_indexed = self._scalar(
+            f"SELECT COUNT(*) FROM {DB_TABLE_HITS} JOIN {DB_TABLE_RECORDS} "
+            f"ON {DB_TABLE_RECORDS}.record_uid = {DB_TABLE_HITS}.record_uid "
+            f"WHERE {hit_where}",
+            hit_params,
+        )
+        n_hits_anchored = self._scalar(
+            f"SELECT COUNT(*) FROM {DB_TABLE_HITS} JOIN {DB_TABLE_RECORDS} "
+            f"ON {DB_TABLE_RECORDS}.record_uid = {DB_TABLE_HITS}.record_uid "
+            f"WHERE {hit_where} AND {DB_TABLE_HITS}.is_anchored = 1",
+            hit_params,
+        )
+        pmids_indexed = {
+            str(row[0])
+            for row in self._conn.execute(
+                f"SELECT DISTINCT pmid FROM {DB_TABLE_RECORDS} WHERE {record_where}",
+                record_params,
+            )
+        }
+
+        excluded_meta = (
+            meta.get("excluded") if isinstance(meta.get("excluded"), Mapping) else {}
+        )
         excluded = {
-            "retracted_records": 0,
-            "retracted_reference_records": 0,
-            # Read-time only. The shard -> repair precedence is applied when the
-            # corpus is built, so patterns.jsonl has one record per paper and
-            # nothing is dropped at read time; the build-time merge count (24)
-            # is reported under `corpus_manifest.patterns.superseded_records`
-            # and must not be added to these counters.
-            "superseded_records": 0,
-            "unattributed_records": 0,
-            "out_of_scope_records": 0,
-            "malformed_records": sum(stat["n_malformed"] for stat in source_stats),
-        }
-
-        seq = 0
-        duplicate_ids: dict[str, int] = {}
-        unverified_hits = 0
-
-        for entry in entries:
-            spec: SourceSpec = entry["spec"]
-            record: dict[str, Any] = entry["record"]
-            pmid = _extract_pmid(record)
-            entry["pmid"] = pmid
-
-            notice = self.retractions.get(pmid) if pmid else None
-            if notice is not None:
-                excluded["retracted_records"] += 1
-                continue
-
-            blob = json.dumps(
-                record, ensure_ascii=False, sort_keys=True, default=str
+            key: int(excluded_meta.get(key) or 0)
+            for key in (
+                "retracted_records",
+                "retracted_reference_records",
+                "superseded_records",
+                "unattributed_records",
+                "out_of_scope_records",
+                "malformed_records",
             )
-            retracted_refs = [
-                candidate
-                for candidate, pattern in retraction_res
-                if pattern.search(blob)
-            ]
-            if retracted_refs:
-                # Conservative: a record that carries a retracted PMID anywhere
-                # is not allowed to pose as evidence, even if its own pmid is
-                # missing or points elsewhere.
-                excluded["retracted_reference_records"] += 1
-                continue
-
-            if scope["mode"] == "included":
-                if pmid is None:
-                    excluded["unattributed_records"] += 1
-                    continue
-                if pmid not in included_pmids and not self.include_out_of_scope:
-                    excluded["out_of_scope_records"] += 1
-                    continue
-                in_scope: bool | None = pmid in included_pmids
-            else:
-                if pmid is None:
-                    excluded["unattributed_records"] += 1
-                    continue
-                in_scope = None
-
-            record_id = self._record_id(spec, record, pmid, entry["row"])
-            record_uid = f"{spec.kind}:{spec.label}:{record_id}"
-            prepared = {
-                **entry,
-                "pmid": pmid,
-                "record_id": record_id,
-                "record_uid": record_uid,
-                "in_scope": in_scope,
-            }
-            self._records_by_pmid.setdefault(pmid, []).append(prepared)
-            self._records_by_uid[record_uid] = prepared
-
-            hits = self._hits_for_record(prepared, start_seq=seq)
-            for hit in hits:
-                if hit.evidence_id in self._hits_by_id:
-                    duplicate_ids[hit.evidence_id] = duplicate_ids.get(
-                        hit.evidence_id, 0
-                    ) + 1
-                    duplicate = duplicate_ids[hit.evidence_id]
-                    warn(f"duplicate_evidence_id:{hit.evidence_id}#dup{duplicate}")
-                    hit = replace(
-                        hit, evidence_id=f"{hit.evidence_id}#dup{duplicate}"
-                    )
-                self._hits_by_id[hit.evidence_id] = hit
-                self._hits_by_record.setdefault(record_uid, []).append(hit)
-                self._all_hits.append(hit)
-                seq = hit.seq + 1
-                if not hit.is_anchored:
-                    unverified_hits += 1
-                for name, _ in (*hit.content, *hit.record_context):
-                    self._field_names.add(name)
-
-            source_stats[entry["spec_index"]]["n_records_indexed"] += 1
-            source_stats[entry["spec_index"]]["n_hits"] += len(hits)
-
-        self._all_hits.sort(key=lambda hit: (hit.pmid, hit.seq))
-        for uid in self._hits_by_record:
-            self._hits_by_record[uid].sort(key=lambda hit: hit.seq)
-
-        fingerprint_parts = [
-            f"scope:{scope.get('sha256') or 'none'}:{scope.get('mode')}"
-        ]
-        for stat in source_stats:
-            fingerprint_parts.append(
-                f"{stat['label']}:{stat.get('sha256') or 'missing'}:{stat['n_records']}"
-            )
-        corpus_fingerprint = _sha256_text("|".join(fingerprint_parts))[:32]
-
-        pmids_indexed = set(self._records_by_pmid)
-        coverage: dict[str, Any] = {
-            "n_pmids_indexed": len(pmids_indexed),
         }
+        # ``superseded_records`` is a *read-time* number: the merge already
+        # happened in the corpus, so nothing is skipped at query time. The
+        # build-time merge count stays in the manifest (``patterns``) and in
+        # ``db.build_excluded`` for provenance.
+        excluded["superseded_records"] = 0
+        # Count retrieval records in gate order: own retraction, reference
+        # retraction, then scope. Code sources have separate counts.
+        build_by_kind = meta.get("excluded_by_kind")
+        if isinstance(build_by_kind, Mapping):
+            excluded["retracted_records"] = sum(
+                int(build_by_kind.get(kind, {}).get("retracted_records", {}).get("records", 0))
+                for kind, _, _ in CORPUS_FILES
+            )
+        live_retracted = sorted(self.retractions.pmids)
+        own_retracted = 0
+        if live_retracted:
+            own_retracted = self._scalar(
+                f"SELECT COUNT(*) FROM {DB_TABLE_RECORDS} WHERE pmid IN "
+                f"({','.join('?' * len(live_retracted))})",
+                live_retracted,
+            )
+        excluded["retracted_records"] += own_retracted
+        eligible_where, eligible_params = self._indexed_where(apply_scope=False)
+        eligible = self._scalar(
+            f"SELECT COUNT(*) FROM {DB_TABLE_RECORDS} WHERE {eligible_where}",
+            eligible_params,
+        )
+        total_records = self._scalar(f"SELECT COUNT(*) FROM {DB_TABLE_RECORDS}")
+        excluded["retracted_reference_records"] = total_records - own_retracted - eligible
+        excluded["out_of_scope_records"] = eligible - n_records_indexed
+        excluded_by_kind = meta.get("excluded_by_kind")
+        n_records_loaded = 0
+        if isinstance(excluded_by_kind, Mapping):
+            for kind, _name, _label in CORPUS_FILES:
+                block = excluded_by_kind.get(kind)
+                if isinstance(block, Mapping):
+                    n_records_loaded += int(block.get("n_records_source") or 0)
+        else:
+            n_records_loaded = int(meta.get("n_records_source") or 0)
+
+        coverage: dict[str, Any] = {"n_pmids_indexed": len(pmids_indexed)}
         if scope["mode"] == "included":
             coverage.update(
                 {
-                    "n_pmids_in_list": len(included_pmids),
-                    "n_list_pmids_with_records": len(pmids_indexed & included_pmids),
+                    "n_pmids_in_list": len(self._included),
+                    "n_list_pmids_with_records": len(
+                        pmids_indexed & self._included
+                    ),
                     "n_list_pmids_without_records": len(
-                        included_pmids - pmids_indexed
+                        self._included - pmids_indexed
                     ),
                 }
             )
 
-        self._scope = scope
+        digests = meta.get("digests") if isinstance(meta.get("digests"), Mapping) else {}
+        db_bytes = int(meta.get("db_bytes") or 0)
+        if not db_bytes:
+            try:
+                db_bytes = path.stat().st_size
+            except OSError:
+                db_bytes = 0
+        self._db_block = {
+            "path": str(path),
+            "schema_id": meta.get("schema_id"),
+            "schema_version": meta.get("schema_version"),
+            "generator": meta.get("generator"),
+            "generator_version": meta.get("generator_version"),
+            "built_utc": meta.get("built_utc"),
+            "fts_enabled": bool(meta.get("fts_enabled")),
+            "fts_tokenizer": meta.get("fts_tokenizer"),
+            "n_records": int(meta.get("n_records") or 0),
+            "n_hits": int(meta.get("n_hits") or 0),
+            "n_code_sources": int(meta.get("n_code_sources") or 0),
+            "n_pmids": int(meta.get("n_pmids") or 0),
+            "db_bytes": db_bytes,
+            "corpus_fingerprint": meta.get("corpus_fingerprint"),
+            "digests": dict(digests),
+            "pmid_list": dict(db_pmid_list),
+            "source_files": dict(meta.get("source_files") or {}),
+            "build_excluded": dict(excluded_meta),
+        }
+
         self._stats = {
             "status": "built",
-            "built_utc": _utc_now(),
+            "built_utc": str(meta.get("built_utc") or _utc_now()),
             "research_dir": str(self.research_dir),
-            "corpus_fingerprint": corpus_fingerprint,
+            "corpus_fingerprint": meta.get("corpus_fingerprint"),
             "pmid_list": {
                 "path": scope.get("path"),
                 "sha256": scope.get("sha256"),
@@ -1274,14 +1315,11 @@ class ScopeKnowledge:
             },
             "sources": source_stats,
             "corpus_manifest": copy.deepcopy(self._manifest),
-            "n_records_loaded": len(entries),
-            "n_records_indexed": sum(
-                1 for entries_for_pmid in self._records_by_pmid.values()
-                for _ in entries_for_pmid
-            ),
-            "n_hits_indexed": len(self._all_hits),
-            "n_hits_anchored": len(self._all_hits) - unverified_hits,
-            "n_hits_unverified": unverified_hits,
+            "n_records_loaded": n_records_loaded,
+            "n_records_indexed": n_records_indexed,
+            "n_hits_indexed": n_hits_indexed,
+            "n_hits_anchored": n_hits_anchored,
+            "n_hits_unverified": n_hits_indexed - n_hits_anchored,
             "n_fields": len(self._field_names),
             "excluded": excluded,
             "coverage": coverage,
@@ -1294,38 +1332,70 @@ class ScopeKnowledge:
             "policy": copy.deepcopy(POLICY),
             "warnings": warnings,
             "warning_count": warning_count,
-            "duplicate_evidence_ids": duplicate_ids,
+            "backend": "sqlite_fts5",
+            "db": copy.deepcopy(self._db_block),
         }
         self._built = True
 
+    def _scalar(self, sql: str, params: Sequence[Any] | None = None) -> int:
+        row = self._conn.execute(sql, list(params or ())).fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else 0
+
+    def _indexed_where(
+        self,
+        *,
+        extra: str | None = None,
+        apply_scope: bool = True,
+        extra_params: Sequence[Any] | None = None,
+    ) -> tuple[str, list[Any]]:
+        """SQL predicate for rows the runtime may serve.
+
+        ``records.retracted_ref = 0`` drops records that merely mention a
+        retracted paper. The configured inclusion list and the *live* retraction
+        registry are applied here too, so a database built against another list
+        is still served under the configured scope.
+        """
+        clauses = [f"{DB_TABLE_RECORDS}.retracted_ref = 0"]
+        params: list[Any] = []
+        # Live reference gate: a record owned by another paper that *mentions* a
+        # retracted PMID (anywhere in the raw record, including fields the
+        # projection drops) is not served, even though it was stored by a build
+        # that predates the notice. This is the runtime counterpart of the
+        # build-time ``retracted_ref`` flag, which only knows the registry that
+        # existed at build time.
+        live_retracted = sorted(self.retractions.pmids)
+        if live_retracted:
+            clauses.append(
+                f"{DB_TABLE_RECORDS}.record_uid NOT IN (SELECT owner_key FROM "
+                f"pmid_refs WHERE owner = 'record' AND ref_pmid IN "
+                f"({','.join('?' * len(live_retracted))}))"
+            )
+            params.extend(live_retracted)
+        if apply_scope:
+            pmids = sorted(self._included)
+            clauses.append(
+                f"{DB_TABLE_RECORDS}.pmid IN ({','.join('?' * len(pmids))})"
+            )
+            params.extend(pmids)
+        if live_retracted:
+            clauses.append(
+                f"{DB_TABLE_RECORDS}.pmid NOT IN ({','.join('?' * len(live_retracted))})"
+            )
+            params.extend(live_retracted)
+        if extra:
+            clauses.append(extra)
+            params.extend(list(extra_params or ()))
+        return " AND ".join(clauses), params
+
     def _load_scope(self, warn) -> dict:
-        candidates, explicit = self._pmid_list_candidates()
+        candidates = self._pmid_list_candidates()
         existing = [path for path in candidates if path.is_file()]
         if not existing:
-            if explicit or not self.allow_missing_pmid_list:
-                raise CorpusConfigError(
-                    "pmid_list_missing: no readable PMID list at "
-                    + ", ".join(str(path) for path in candidates)
-                    + (
-                        "; pass pmid_list_path explicitly or set "
-                        f"{PMID_LIST_ENV}."
-                    )
-                )
-            warn(
-                "pmid_list_missing: retrieval is UNFILTERED; the authoritative "
-                "405-paper inclusion scope is not applied"
+            raise CorpusConfigError(
+                "pmid_list_missing: no readable PMID list at "
+                + ", ".join(str(path) for path in candidates)
+                + f"; pass pmid_list_path explicitly or set {PMID_LIST_ENV}."
             )
-            return {
-                "mode": "unfiltered",
-                "path": None,
-                "sha256": None,
-                "n_pmids": 0,
-                "pmids_set": frozenset(),
-                "known_snapshot": None,
-                "matches_known_snapshot": None,
-                "n_malformed": 0,
-                "n_duplicates": 0,
-            }
 
         path = existing[0]
         try:
@@ -1388,19 +1458,13 @@ class ScopeKnowledge:
             "n_duplicates": duplicates,
         }
 
-    def _pmid_list_candidates(self) -> tuple[list[Path], bool]:
+    def _pmid_list_candidates(self) -> list[Path]:
         if self.pmid_list_path is not None:
-            return [self.pmid_list_path], True
+            return [self.pmid_list_path]
         env_path = os.environ.get(PMID_LIST_ENV)
         if env_path:
-            return [Path(env_path).expanduser()], True
-        return list(DEFAULT_PMID_LIST_CANDIDATES), False
-
-    def _display_path(self, path: Path) -> str:
-        try:
-            return str(path.resolve().relative_to(self.research_dir.resolve()))
-        except (ValueError, OSError):
-            return str(path)
+            return [Path(env_path).expanduser()]
+        return list(DEFAULT_PMID_LIST_CANDIDATES)
 
     @staticmethod
     def _record_id(
@@ -1421,82 +1485,59 @@ class ScopeKnowledge:
             return f"{pmid or 'unattributed'}:method:{row}"
         return f"{spec.label}:{pmid or 'unattributed'}:row{row}"
 
-    # -------------------------------------------------------------------- hits
+    # -------------------------------------------------------------- row access
 
-    def _hits_for_record(self, entry: dict[str, Any], start_seq: int) -> list[KnowledgeHit]:
-        record = entry["record"]
-        kind = entry["spec"].kind
-        if kind == "workflow":
-            units = _workflow_units(record)
-        elif kind == "method":
-            units = _method_units(record)
-        else:
-            units = _pattern_units(record, entry["pmid"])
-
-        context_pairs, context_fields = _record_context(kind, record)
-        context_tiers = {name: TIER_EXTRACTION for name, _ in context_pairs}
-        hits: list[KnowledgeHit] = []
-        seq = start_seq
-        for unit in units:
-            content_pairs = [
-                (name, value)
-                for name, value in unit["content"]
-                if not _is_empty(value)
-            ]
-            field_tiers = {
-                name: unit["tiers"].get(name, TIER_EXTRACTION)
-                for name, _ in content_pairs
-            }
-            for name, _ in context_pairs:
-                field_tiers[name] = context_tiers[name]
-            search_fields = tuple(
-                (name, _normalize_text(value))
-                for name, value in (*content_pairs, *context_pairs)
-            )
-            evidence_id = self._evidence_id(entry, unit)
-            locator = unit.get("locator")
-            if isinstance(locator, str):
-                locator = locator.strip() or None
-            hits.append(
-                KnowledgeHit(
-                    evidence_id=evidence_id,
-                    source_kind=kind,
-                    source_file=entry["source_file"],
-                    source_label=entry["spec"].label,
-                    source_sha256=entry["source_sha256"],
-                    pmid=entry["pmid"],
-                    record_id=entry["record_id"],
-                    record_uid=entry["record_uid"],
-                    granularity=unit["granularity"],
-                    locator=locator,
-                    locator_type=_locator_type(locator),
-                    verbatim=(
-                        unit["verbatim"].strip()
-                        if isinstance(unit.get("verbatim"), str)
-                        and unit["verbatim"].strip()
-                        else None
-                    ),
-                    content=tuple(content_pairs),
-                    record_context=tuple(context_pairs),
-                    field_tiers=tuple(field_tiers.items()),
-                    context_fields=tuple(context_fields),
-                    in_scope=entry["in_scope"],
-                    seq=seq,
-                    unit_index=unit.get("unit_index", 0),
-                    search_fields=search_fields,
+    def _hit_rows(self, **kwargs: Any) -> list[dict]:
+        """``scope_corpus.hit_rows`` restricted to the kwargs it supports."""
+        module = self._corpus_module()
+        fn = module.hit_rows
+        params = self._hit_row_params
+        if params is None:
+            try:
+                signature = inspect.signature(fn)
+                allows_any = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
                 )
-            )
-            seq += 1
-        return hits
+                params = () if allows_any else tuple(signature.parameters)
+            except (TypeError, ValueError):  # pragma: no cover - C callables
+                params = ()
+            self._hit_row_params = params
+        if params:
+            kwargs = {key: value for key, value in kwargs.items() if key in params}
+        kwargs = {key: value for key, value in kwargs.items() if value is not None}
+        return fn(self._conn, **kwargs)
 
-    @staticmethod
-    def _evidence_id(entry: dict[str, Any], unit: dict[str, Any]) -> str:
-        kind = entry["spec"].kind
-        record_id = entry["record_id"]
-        suffix = unit["suffix"]
-        if kind == "method":
-            return f"method:{record_id}"
-        return f"{kind}:{record_id}:{suffix}"
+    def _runtime_scope_ok(self, pmid: str | None) -> bool:
+        return pmid in self._included
+
+    def _recomputed_in_scope(self, pmid: str | None) -> bool | None:
+        return pmid in self._included if pmid is not None else None
+
+    def _references_retraction(self, row: dict) -> bool:
+        return bool(row["retracted_ref"] or row["record_uid"] in self._mentioned_uids)
+
+    def _evidence_exclusion(self, row: dict, evidence_id: str) -> dict | None:
+        pmid = row["pmid"]
+        notice = self.retractions.get(pmid)
+        if notice is not None:
+            return {
+                "status": "excluded", "reason": "retracted",
+                "evidence_id": evidence_id, "pmid": pmid,
+                "retraction": notice.as_dict(),
+            }
+        if self._references_retraction(row):
+            return {
+                "status": "excluded", "reason": "retracted_reference",
+                "evidence_id": evidence_id, "pmid": pmid,
+            }
+        if not self._runtime_scope_ok(pmid):
+            return {"status": "out_of_scope", "evidence_id": evidence_id, "pmid": pmid}
+        return None
+
+    def _row_for_evidence(self, evidence_id: str) -> dict | None:
+        rows = self._hit_rows(evidence_id=evidence_id, exclude_retracted_ref=False)
+        return rows[0] if rows else None
 
     # ------------------------------------------------------------------ search
 
@@ -1527,9 +1568,10 @@ class ScopeKnowledge:
 
         ``match="all"`` requires every query term somewhere in the hit;
         ``match="any"`` requires at least one. Quotes keep a phrase together.
-        Results are ordered by PMID then source order, never by relevance or
-        corpus frequency. Pagination is explicit: ``page`` reports ``total``,
-        ``has_more`` and ``next_offset``.
+        Candidate rows are selected in SQLite - structure, scope, retraction and
+        the trigram FTS5 index - and the token-boundary matcher, tier assignment
+        and pagination then run over those candidates. Results are ordered by
+        PMID then source order, never by relevance or corpus frequency.
         """
         limit, offset = _page_bounds(limit, offset)
         if query is not None and not isinstance(query, str):
@@ -1555,7 +1597,9 @@ class ScopeKnowledge:
                 try:
                     raw_pmids = list(pmids)
                 except TypeError as exc:
-                    raise QueryError("pmids must be a PMID or an iterable of PMIDs") from exc
+                    raise QueryError(
+                        "pmids must be a PMID or an iterable of PMIDs"
+                    ) from exc
             pmid_filter = set()
             for item in raw_pmids:
                 normalized = normalize_pmid(item)
@@ -1590,20 +1634,41 @@ class ScopeKnowledge:
         if tier_filter and TIER_UNVERIFIED in tier_filter:
             include_unverified = True
 
-        rows: list[tuple[KnowledgeHit, str, list[str], str]] = []
-        for hit in self._all_hits:
-            if hit.pmid in self.retractions:
-                # Applies even if the notice was added after the index was
-                # built; the registry is authoritative at query time.
+        rowids = None
+        if terms:
+            rowids = self._corpus_module().search_hit_rowids(
+                self._conn, terms, match=match
+            )
+        scoped_pmids = sorted(self._included) if pmid_filter is None else None
+        rows = self._hit_rows(
+            rowids=sorted(rowids) if rowids is not None else None,
+            pmids=sorted(pmid_filter) if pmid_filter is not None else None,
+            include_pmids=scoped_pmids,
+            # An explicitly empty iterable is a filter that matches nothing, not
+            # "no filter"; only ``None`` means unfiltered.
+            source_kinds=(
+                sorted(source_filter) if source_filter is not None else None
+            ),
+            granularities=(
+                sorted(granularity_filter)
+                if granularity_filter is not None
+                else None
+            ),
+            anchored_only=True if not include_unverified else None,
+        )
+
+        matched_rows: list[tuple[dict, str, list[str], str]] = []
+        for row in rows:
+            if (self.retractions.get(row["pmid"]) is not None
+                    or self._references_retraction(row)
+                    or not self._runtime_scope_ok(row["pmid"])):
                 continue
-            if (
-                not include_unverified
-                and not hit.is_anchored
-            ):
-                continue
+            hit = _hit_from_row(row)
+            # The SQL predicate already applied these; repeating them keeps the
+            # semantics correct if a reader supports fewer pushdown kwargs.
             if pmid_filter is not None and hit.pmid not in pmid_filter:
                 continue
-            if source_filter is not None and hit.source_kind not in source_filter:
+            if not include_unverified and not hit.is_anchored:
                 continue
             if (
                 section_filter is not None
@@ -1615,7 +1680,8 @@ class ScopeKnowledge:
                 and hit.granularity not in granularity_filter
             ):
                 continue
-            if in_scope is not None and hit.in_scope is not in_scope:
+            resolved_in_scope = self._recomputed_in_scope(hit.pmid)
+            if in_scope is not None and resolved_in_scope is not in_scope:
                 continue
             if stage_filter is not None and not (
                 _values_for(hit, "pipeline_stage") & stage_filter
@@ -1653,22 +1719,16 @@ class ScopeKnowledge:
             considered = hit.search_fields
             if field_filter is not None:
                 considered = tuple(
-                    (name, text)
-                    for name, text in considered
-                    if name in field_filter
+                    (name, text) for name, text in considered if name in field_filter
                 )
             if not considered:
                 continue
             if terms:
                 blob = "\n".join(text for _, text in considered)
                 if match == "all":
-                    if not all(
-                        matcher.search(blob) for matcher in term_matchers
-                    ):
+                    if not all(matcher.search(blob) for matcher in term_matchers):
                         continue
-                elif not any(
-                    matcher.search(blob) for matcher in term_matchers
-                ):
+                elif not any(matcher.search(blob) for matcher in term_matchers):
                     continue
                 coverage = [
                     (
@@ -1679,9 +1739,7 @@ class ScopeKnowledge:
                 ]
                 best_coverage = max(count for _, count in coverage)
                 matched_fields = [
-                    name
-                    for name, count in coverage
-                    if count == best_coverage and count > 0
+                    name for name, count in coverage if count == best_coverage and count > 0
                 ]
             else:
                 best_coverage = 0
@@ -1690,8 +1748,7 @@ class ScopeKnowledge:
             tiers_map = hit.tiers
             if matched_fields:
                 tier = _best_tier(
-                    tiers_map.get(name, TIER_UNVERIFIED)
-                    for name in matched_fields
+                    tiers_map.get(name, TIER_UNVERIFIED) for name in matched_fields
                 )
                 # A quote that covers only part of an AND query must not be
                 # presented as verbatim support for the whole query.
@@ -1712,11 +1769,11 @@ class ScopeKnowledge:
                 tier_scope = "unit"
             if tier_filter is not None and tier not in tier_filter:
                 continue
-            rows.append((hit, tier, matched_fields, tier_scope))
+            matched_rows.append((row, tier, matched_fields, tier_scope))
 
-        rows.sort(key=lambda row: (row[0].pmid, row[0].seq))
-        total = len(rows)
-        window = rows[offset : offset + limit]
+        matched_rows.sort(key=lambda item: (item[0]["pmid"], item[0]["seq"]))
+        total = len(matched_rows)
+        window = matched_rows[offset : offset + limit]
 
         filters_echo: dict[str, Any] = {}
         for name, value in (
@@ -1729,10 +1786,7 @@ class ScopeKnowledge:
             ),
             ("tiers", sorted(tier_filter) if tier_filter else None),
             ("fields", sorted(field_filter) if field_filter else None),
-            (
-                "pipeline_stages",
-                sorted(stage_filter) if stage_filter else None,
-            ),
+            ("pipeline_stages", sorted(stage_filter) if stage_filter else None),
             ("purposes", sorted(purpose_filter) if purpose_filter else None),
             (
                 "method_names",
@@ -1747,10 +1801,7 @@ class ScopeKnowledge:
                 "evidence_types",
                 sorted(evidence_type_filter) if evidence_type_filter else None,
             ),
-            (
-                "directions",
-                sorted(direction_filter) if direction_filter else None,
-            ),
+            ("directions", sorted(direction_filter) if direction_filter else None),
             (
                 "rationale_sources",
                 sorted(rationale_filter) if rationale_filter else None,
@@ -1772,13 +1823,13 @@ class ScopeKnowledge:
             },
             "page": _page_payload(total, offset, len(window), limit),
             "hits": [
-                hit.as_payload(
+                _hit_from_row(row).as_payload(
                     tier=tier,
                     matched_fields=matched,
                     tier_scope=tier_scope,
-                    editorial_notices=self.editorial_notices.for_pmid(hit.pmid),
+                    editorial_notices=self.editorial_notices.for_pmid(row.get("pmid")),
                 )
-                for hit, tier, matched, tier_scope in window
+                for row, tier, matched, tier_scope in window
             ],
             "corpus": self._corpus_metadata(),
             "warnings": list(self._stats.get("warnings") or ()),
@@ -1805,28 +1856,18 @@ class ScopeKnowledge:
         if not isinstance(evidence_id, str) or not evidence_id.strip():
             raise QueryError("evidence_id must be a non-empty string")
         fields = _matched_field_list(matched_fields)
-        hit = self._hits_by_id.get(evidence_id)
-        if hit is None:
+        row = self._row_for_evidence(evidence_id)
+        if row is None:
             return {
                 "status": "not_found",
                 "evidence_id": evidence_id,
-                "note": (
-                    "not indexed: retracted, out of scope, unattributed, or absent"
-                ),
+                "note": "not indexed: retracted, out of scope, unattributed, or absent",
             }
-        notice = self.retractions.get(hit.pmid)
-        if notice is not None:
-            return {
-                "status": "excluded",
-                "reason": "retracted",
-                "evidence_id": evidence_id,
-                "pmid": hit.pmid,
-                "retraction": notice.as_dict(),
-            }
-        if (
-            not include_unverified
-            and not hit.is_anchored
-        ):
+        exclusion = self._evidence_exclusion(row, evidence_id)
+        if exclusion is not None:
+            return exclusion
+        hit = _hit_from_row(row)
+        if not include_unverified and not hit.is_anchored:
             return {
                 "status": "unverified_hidden",
                 "evidence_id": evidence_id,
@@ -1869,59 +1910,47 @@ class ScopeKnowledge:
                 raise QueryError(f"{name} must be an integer")
             if value < 0 or value > MAX_CONTEXT:
                 raise QueryError(f"{name} must be between 0 and {MAX_CONTEXT}")
-        hit = self._hits_by_id.get(evidence_id)
-        if hit is None:
+        row = self._row_for_evidence(evidence_id)
+        if row is None:
             return {"status": "not_found", "evidence_id": evidence_id}
-        notice = self.retractions.get(hit.pmid)
-        if notice is not None:
-            return {
-                "status": "excluded",
-                "reason": "retracted",
-                "evidence_id": evidence_id,
-                "pmid": hit.pmid,
-                "retraction": notice.as_dict(),
-            }
-        if (
-            not include_unverified
-            and not hit.is_anchored
-        ):
+        exclusion = self._evidence_exclusion(row, evidence_id)
+        if exclusion is not None:
+            return exclusion
+        hit = _hit_from_row(row)
+        if not include_unverified and not hit.is_anchored:
             return {
                 "status": "unverified_hidden",
                 "evidence_id": evidence_id,
                 "tier": TIER_UNVERIFIED,
             }
-        siblings = self._hits_by_record.get(hit.record_uid, [])
-        siblings = [
-            sibling
-            for sibling in siblings
-            if sibling.pmid not in self.retractions
-        ]
+        # Every sibling belongs to the same record already checked above.
+        siblings = self._hit_rows(record_uid=hit.record_uid)
         if not include_unverified:
-            siblings = [
-                sibling for sibling in siblings if sibling.is_anchored
-            ]
-        try:
-            center_index = next(
+            siblings = [sibling for sibling in siblings if sibling.get("is_anchored")]
+        siblings.sort(key=lambda item: item["seq"])
+        center_index = next(
+            (
                 index
                 for index, sibling in enumerate(siblings)
-                if sibling.evidence_id == evidence_id
-            )
-        except StopIteration:
+                if sibling["evidence_id"] == evidence_id
+            ),
+            None,
+        )
+        if center_index is None:
             return {"status": "not_found", "evidence_id": evidence_id}
         start = max(0, center_index - before)
         end = min(len(siblings), center_index + after + 1)
         window = siblings[start:end]
         payloads = []
         for sibling in window:
-            tier, tier_scope = _scoped_tier(sibling, fields)
+            sibling_hit = _hit_from_row(sibling)
+            tier, tier_scope = _scoped_tier(sibling_hit, fields)
             payloads.append(
-                sibling.as_payload(
+                sibling_hit.as_payload(
                     tier=tier,
                     matched_fields=fields or (),
                     tier_scope=tier_scope,
-                    editorial_notices=self.editorial_notices.for_pmid(
-                        sibling.pmid
-                    ),
+                    editorial_notices=self.editorial_notices.for_pmid(sibling_hit.pmid),
                 )
             )
         return {
@@ -1964,9 +1993,7 @@ class ScopeKnowledge:
         self._ensure_built()
 
         notices = list(self.editorial_notices.for_pmid(normalized))
-        correction_status = (
-            "recorded_impact_unknown" if notices else "unknown"
-        )
+        correction_status = "recorded_impact_unknown" if notices else "unknown"
         notice_payload = [notice.as_dict() for notice in notices]
         notice = self.retractions.get(normalized)
         if notice is not None:
@@ -1985,31 +2012,27 @@ class ScopeKnowledge:
                 "page": _page_payload(0, offset, 0, limit),
                 "note": "retracted papers are hard-excluded from retrieval",
             }
-        if self._scope.get("mode") == "included":
-            if (
-                normalized not in self._scope.get("pmids_set", frozenset())
-                and not self.include_out_of_scope
-            ):
-                return {
-                    "status": "out_of_scope",
-                    "reason": "not in the authoritative PMID list",
-                    "pmid": normalized,
-                    "records": [],
-                    "page": _page_payload(0, offset, 0, limit),
-                }
+        matching = list(self._corpus_module().iter_record_rows(
+            self._conn, pmid=normalized, record_id=record_id, source_kind=source_kind,
+        ))
+        entries = [entry for entry in matching if not self._references_retraction(entry)]
+        if matching and not entries:
+            return {
+                "status": "excluded",
+                "reason": "retracted_reference",
+                "pmid": normalized,
+                "records": [],
+                "page": _page_payload(0, offset, 0, limit),
+            }
+        if normalized not in self._included:
+            return {
+                "status": "out_of_scope",
+                "reason": "not in the authoritative PMID list",
+                "pmid": normalized,
+                "records": [],
+                "page": _page_payload(0, offset, 0, limit),
+            }
 
-        entries = list(self._records_by_pmid.get(normalized) or ())
-        if record_id is not None:
-            entries = [
-                entry for entry in entries if entry["record_id"] == record_id
-            ]
-        if source_kind is not None:
-            entries = [
-                entry
-                for entry in entries
-                if entry["spec"].kind == source_kind
-            ]
-        entries.sort(key=lambda entry: (entry["spec_index"], entry["row"]))
         if not entries:
             return {
                 "status": "not_found",
@@ -2024,17 +2047,17 @@ class ScopeKnowledge:
         window = entries[offset : offset + limit]
         records = []
         for entry in window:
-            hits = self._hits_by_record.get(entry["record_uid"], [])
+            hits = self._hit_rows(record_uid=entry["record_uid"])
             records.append(
                 {
-                    "source_kind": entry["spec"].kind,
-                    "source_label": entry["spec"].label,
+                    "source_kind": entry["source_kind"],
+                    "source_label": entry["source_label"],
                     "source_file": entry["source_file"],
                     "source_sha256": entry["source_sha256"],
                     "record_id": entry["record_id"],
                     "record_uid": entry["record_uid"],
-                    "evidence_ids": [hit.evidence_id for hit in hits],
-                    "record": _sanitize(entry["record"], include_author_focus),
+                    "evidence_ids": [hit["evidence_id"] for hit in hits],
+                    "record": _sanitize(entry["record_payload"], include_author_focus),
                     "author_focus_included": bool(include_author_focus),
                 }
             )
@@ -2066,6 +2089,8 @@ class ScopeKnowledge:
         # The registries can grow after the index was built; report them live.
         stats["retractions"] = self.retractions.as_list()
         stats["editorial_notices"] = self.editorial_notices.as_list()
+        stats["backend"] = "sqlite_fts5"
+        stats["db"] = copy.deepcopy(self._db_block)
         return stats
 
     def _corpus_metadata(self) -> dict:
@@ -2078,7 +2103,147 @@ class ScopeKnowledge:
             "n_records_indexed": self._stats["n_records_indexed"],
             "n_hits_indexed": self._stats["n_hits_indexed"],
             "coverage": copy.deepcopy(self._stats["coverage"]),
+            "backend": "sqlite_fts5",
+            "db": copy.deepcopy(self._db_block),
         }
+
+
+# ------------------------------------------------------------- row derivation
+
+
+def _hit_from_row(row: Mapping[str, Any]) -> KnowledgeHit:
+    """Build the immutable hit view from one ``scope_corpus.hit_rows`` dict."""
+    content = tuple(
+        (str(name), value) for name, value in (row.get("content") or ())
+    )
+    record_context = tuple(
+        (str(name), value) for name, value in (row.get("record_context") or ())
+    )
+    field_tiers = tuple(
+        (str(name), str(tier))
+        for name, tier in (row.get("field_tiers") or {}).items()
+    )
+    search_fields = tuple(
+        (str(name), _normalize_text(value))
+        for name, value in (
+            row.get("search_fields")
+            or [(name, value) for name, value in (*content, *record_context)]
+        )
+    )
+    return KnowledgeHit(
+        evidence_id=str(row.get("evidence_id")),
+        source_kind=str(row.get("source_kind")),
+        source_file=str(row.get("source_file") or ""),
+        source_label=str(row.get("source_label") or ""),
+        source_sha256=str(row.get("source_sha256") or ""),
+        pmid=str(row.get("pmid")),
+        record_id=str(row.get("record_id") or ""),
+        record_uid=str(row.get("record_uid") or ""),
+        granularity=str(row.get("granularity") or "record_context"),
+        locator=row.get("locator"),
+        locator_type=row.get("locator_type"),
+        verbatim=row.get("verbatim"),
+        content=content,
+        record_context=record_context,
+        field_tiers=field_tiers,
+        context_fields=tuple(
+            str(name) for name in (row.get("context_fields") or ())
+        ),
+        in_scope=(
+            None if row.get("in_scope") is None else bool(row.get("in_scope"))
+        ),
+        seq=int(row.get("seq") or 0),
+        unit_index=int(row.get("unit_index") or 0),
+        search_fields=search_fields,
+    )
+
+
+def derive_record_hits(
+    *,
+    kind: str,
+    record: Mapping[str, Any],
+    pmid: str | None,
+    record_id: str,
+    record_uid: str,
+    source_file: str,
+    source_label: str,
+    source_sha256: str,
+    in_scope: bool | None,
+    start_seq: int = 0,
+    evidence_ids: Iterable[str] | None = None,
+) -> list[dict]:
+    """Derive the evidence units of one record as database-insert-ready rows.
+
+    This is the single implementation of the evidence layer: the runtime
+    database builder calls it at build time (``tools/build_runtime_corpus.py``)
+    so evidence ids, unit order, tiers, context fields and FTS text cannot drift
+    from the reader. Evidence ids are consumed from *evidence_ids* when supplied
+    so a repeated id can be disambiguated by the caller; this function never
+    invents a suffix.
+    """
+    kind = str(kind).strip().lower()
+    if kind == "workflow":
+        units = _workflow_units(record)
+    elif kind == "method":
+        units = _method_units(record)
+    elif kind == "pattern":
+        units = _pattern_units(record, pmid)
+    else:
+        raise QueryError(f"unknown record kind: {kind!r}")
+
+    context_pairs, context_fields = _record_context(kind, record)
+    rows: list[dict] = []
+    seq = int(start_seq)
+    for unit in units:
+        content_pairs = [
+            (name, value) for name, value in unit["content"] if not _is_empty(value)
+        ]
+        field_tiers = {
+            name: unit["tiers"].get(name, TIER_EXTRACTION) for name, _ in content_pairs
+        }
+        for name, _ in context_pairs:
+            field_tiers[name] = TIER_EXTRACTION
+        search_fields = [
+            (name, _normalize_text(value))
+            for name, value in (*content_pairs, *context_pairs)
+        ]
+        if kind == "method":
+            evidence_id = f"method:{record_id}"
+        else:
+            evidence_id = f"{kind}:{record_id}:{unit['suffix']}"
+        locator = unit.get("locator")
+        if isinstance(locator, str):
+            locator = locator.strip() or None
+        verbatim_value = unit.get("verbatim")
+        verbatim = (
+            verbatim_value.strip()
+            if isinstance(verbatim_value, str) and verbatim_value.strip()
+            else None
+        )
+        locator_type = _locator_type(locator)
+        rows.append(
+            {
+                "evidence_id": evidence_id,
+                "seq": seq,
+                "unit_index": int(unit.get("unit_index") or 0),
+                "granularity": unit["granularity"],
+                "locator": locator,
+                "locator_type": locator_type,
+                "verbatim": verbatim,
+                "content": [[name, value] for name, value in content_pairs],
+                "record_context": [[name, value] for name, value in context_pairs],
+                "field_tiers": field_tiers,
+                "context_fields": list(context_fields),
+                "search_fields": [[name, text] for name, text in search_fields],
+                "search_text": "\n".join(text for _, text in search_fields),
+                "is_anchored": int(
+                    locator is not None and locator_type is not None and verbatim is not None
+                ),
+                "in_scope": in_scope,
+            }
+        )
+        seq += 1
+    return rows
 
 
 # ----------------------------------------------------------------- record units
@@ -2327,71 +2492,26 @@ def _pattern_units(record: Mapping[str, Any], pmid: str | None) -> list[dict[str
 
 
 def corpus_dir(research_dir: str | Path | None = None) -> Path:
-    """Return ``<research>/corpus``; never globs, never falls back to shards."""
+    """Return ``<research>/corpus``.
+
+    This is the directory that *contains* the runtime database and its build
+    inputs; no retrieval path globs it and nothing here reads a ``*.jsonl``.
+    """
     base = Path(
         research_dir if research_dir is not None else DEFAULT_RESEARCH_DIR
     ).expanduser()
     return base / CORPUS_SUBDIR
 
 
-def _infer_source_kind(path: Path) -> str:
-    name = path.name.casefold()
-    if name.startswith("workflows"):
-        return "workflow"
-    if name.startswith("methods"):
-        return "method"
-    return "pattern"
-
-
-def _default_source_specs(research_dir: Path) -> list[SourceSpec]:
-    """The three formal corpus files, in a fixed order.
-
-    Labels are the file stems (``workflows``/``methods``/``patterns``) so that a
-    hit's ``source_label`` names the shipped file. Missing files are reported as
-    missing sources; no fallback scans the shard directories.
-    """
-    root = corpus_dir(research_dir)
-    return [
-        SourceSpec(kind, root / name, label)
-        for kind, name, label in CORPUS_FILES
-    ]
-
-
-def _manifest_entry_for(
-    manifest: Mapping[str, Any], research_dir: Path, spec: SourceSpec
-) -> dict | None:
-    """Manifest row for one source, only when it names *this* directory.
-
-    Matching by file name alone would let a test corpus called
-    ``patterns.jsonl`` inherit the shipped snapshot's hash and be reported as
-    tampered with. The parent directory must be the corpus directory too.
-    """
-    files = manifest.get("files") or {}
-    if not isinstance(files, Mapping):
-        return None
-    try:
-        in_corpus = (
-            spec.path.resolve().parent
-            == corpus_dir(research_dir).resolve()
-        )
-    except OSError:
-        return None
-    if not in_corpus:
-        return None
-    entry = files.get(spec.path.name)
-    return dict(entry) if isinstance(entry, Mapping) else None
-
-
-def _read_corpus_manifest(
-    research_dir: Path, specs: Sequence[SourceSpec]
+def _manifest_block(
+    meta: Mapping[str, Any], research_dir: Path, warn
 ) -> dict[str, Any]:
-    """Read ``<research>/corpus/manifest.json`` and relate it to the sources.
+    """Corpus-manifest provenance as recorded in the database at build time.
 
-    The manifest is provenance, not a gate: an absent or unreadable manifest is
-    reported (``status`` other than ``ok``) and the index is still built from
-    the files it can read. When a listed file is actually indexed, its sha256
-    and record count are compared against the manifest; the comparison is
-    reported per source and by warning, never by silently dropping the source.
+    The database stores the development manifest verbatim. Nothing is re-read
+    from ``<research>/corpus``: when the manifest is present in meta its
+    ``n_sources_covered`` is recomputed against the sources the database
+    recorded, and a schema mismatch is reported rather than hidden.
     """
     path = corpus_dir(research_dir) / CORPUS_MANIFEST_NAME
     out: dict[str, Any] = {
@@ -2404,24 +2524,16 @@ def _read_corpus_manifest(
         "pmid_range": None,
         "n_sources_covered": 0,
         "error": None,
+        "source": "database",
     }
-    if not path.is_file():
-        return out
-    try:
-        data = json.loads(path.read_bytes().decode("utf-8-sig"))
-    except (OSError, ValueError) as exc:
-        out["status"] = "unreadable"
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        return out
-    if not isinstance(data, dict):
-        out["status"] = "unreadable"
-        out["error"] = f"manifest is {type(data).__name__}, not an object"
+    data = meta.get("corpus_manifest")
+    if not isinstance(data, Mapping):
         return out
     declared = data.get("files")
     files = {
         str(name): dict(entry)
-        for name, entry in (declared.items() if isinstance(declared, dict) else ())
-        if isinstance(entry, dict)
+        for name, entry in (declared.items() if isinstance(declared, Mapping) else ())
+        if isinstance(entry, Mapping)
     }
     patterns = data.get("patterns")
     out.update(
@@ -2430,23 +2542,31 @@ def _read_corpus_manifest(
             "schema": data.get("schema"),
             "generated_utc": data.get("generated_utc"),
             "files": files,
-            "patterns": dict(patterns) if isinstance(patterns, dict) else None,
+            "patterns": dict(patterns) if isinstance(patterns, Mapping) else None,
             "pmid_range": (
                 dict(data["pmid_range"])
-                if isinstance(data.get("pmid_range"), dict) else None
+                if isinstance(data.get("pmid_range"), Mapping) else None
             ),
         }
     )
+    recorded = {
+        str(entry.get("file") or entry.get("label") or entry.get("kind")): entry
+        for entry in (meta.get("sources") or ())
+        if isinstance(entry, Mapping)
+    }
     out["n_sources_covered"] = sum(
-        1 for spec in specs
-        if _manifest_entry_for(out, research_dir, spec) is not None
+        1
+        for name, entry in recorded.items()
+        if entry.get("sha256") and name in files
     )
     if out["schema"] != CORPUS_SCHEMA:
         out["status"] = "schema_mismatch"
         out["error"] = (
             f"manifest schema is {out['schema']!r}, expected {CORPUS_SCHEMA!r}"
         )
+        warn(f"corpus_manifest_schema_mismatch:{out['schema']}")
     return out
+
 
 
 def _values_for(hit: KnowledgeHit, key: str) -> set[str]:
@@ -2469,7 +2589,12 @@ _DEFAULT_LOCK = threading.Lock()
 
 
 def default_index() -> ScopeKnowledge:
-    """Return a process-wide index configured from the environment defaults."""
+    """A process-wide index configured from the environment.
+
+    ``SCOPE_RESEARCH_DIR`` selects ``<research>/corpus/records.sqlite`` and
+    ``SCOPE_CORPUS_DB`` relocates the file; both are read at construction time
+    (the plugin passes them per kernel invocation).
+    """
     global _DEFAULT_INDEX
     with _DEFAULT_LOCK:
         if _DEFAULT_INDEX is None:

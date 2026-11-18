@@ -422,7 +422,7 @@ def _fallback_payload(reason: str | None) -> dict:
         "source": {"name": "catalog.discovered_methods", "registry_used": False,
                    "n_records": len(methods), "reason": reason},
         "metadata": {"incomplete": True,
-                     "source_path": "research/corpus/methods.jsonl"},
+                     "source_path": "corpus/records.sqlite (method rows)"},
         "methods": methods,
     }
 

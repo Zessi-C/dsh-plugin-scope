@@ -409,3 +409,39 @@ test('the limitations name the parent-death behaviour and do not claim a sandbox
   assert.match(joined, /not a live orphan process/)
   assert.match(joined, /not an OS sandbox/)
 })
+
+test('kernel calls carry the corpus database and research root, so both readers agree', async () => {
+  const { plugin, ctx, root, run } = harness({
+    script: { kernel: { sctda_status: { stdout: '{"status":"ok"}' } } },
+  })
+  await plugin.apply(ctx, {
+    kernelRoot: root,
+    role: 'all',
+    researchDir: 'research',
+    pmidListPath: '/lists/included_pmids_405.txt',
+    corpusDbPath: 'data/records.sqlite',
+  })
+  await byName(ctx, 'sctda_status').execute({}, {})
+  const kernelCall = run.calls.find((call) => call.args[2] === 'call')
+  assert.ok(kernelCall, 'the kernel call was not made')
+  // Relative paths resolve against kernelRoot, never the launching cwd.
+  assert.equal(kernelCall.options.env.SCOPE_CORPUS_DB, join(root, 'data/records.sqlite'))
+  assert.equal(kernelCall.options.env.SCOPE_RESEARCH_DIR, join(root, 'research'))
+})
+
+test('an unset corpusDbPath forwards no SCOPE_CORPUS_DB, leaving the environment as it was', async () => {
+  const { plugin, ctx, root, run } = harness({
+    script: { kernel: { sctda_status: { stdout: '{"status":"ok"}' } } },
+  })
+  await plugin.apply(ctx, {
+    kernelRoot: root,
+    role: 'all',
+    researchDir: 'research',
+    pmidListPath: '/lists/included_pmids_405.txt',
+  })
+  await byName(ctx, 'sctda_status').execute({}, {})
+  const kernelCall = run.calls.find((call) => call.args[2] === 'call')
+  assert.ok(kernelCall, 'the kernel call was not made')
+  assert.equal(kernelCall.options.env.SCOPE_CORPUS_DB, process.env.SCOPE_CORPUS_DB)
+  assert.equal(kernelCall.options.env.SCOPE_RESEARCH_DIR, join(root, 'research'))
+})

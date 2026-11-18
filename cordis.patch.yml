@@ -111,6 +111,10 @@
               extendedPromptSectionName: scope:extended-scientific-draft
               extendedPromptOrder: 12050
               researchDir: research
+              # Empty selects <researchDir>/corpus/records.sqlite; a set value is
+              # resolved against kernelRoot and forwarded as SCOPE_CORPUS_DB to
+              # the knowledge bridge and every kernel call.
+              corpusDbPath: ''
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
@@ -194,6 +198,10 @@
               extendedPromptSectionName: scope:extended-scientific-draft
               extendedPromptOrder: 12050
               researchDir: research
+              # Empty selects <researchDir>/corpus/records.sqlite; a set value is
+              # resolved against kernelRoot and forwarded as SCOPE_CORPUS_DB to
+              # the knowledge bridge and every kernel call.
+              corpusDbPath: ''
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
@@ -296,6 +304,10 @@
               extendedPromptSectionName: scope:extended-scientific-draft
               extendedPromptOrder: 12050
               researchDir: research
+              # Empty selects <researchDir>/corpus/records.sqlite; a set value is
+              # resolved against kernelRoot and forwarded as SCOPE_CORPUS_DB to
+              # the knowledge bridge and every kernel call.
+              corpusDbPath: ''
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
@@ -391,6 +403,10 @@
               extendedPromptSectionName: scope:extended-scientific-draft
               extendedPromptOrder: 12050
               researchDir: research
+              # Empty selects <researchDir>/corpus/records.sqlite; a set value is
+              # resolved against kernelRoot and forwarded as SCOPE_CORPUS_DB to
+              # the knowledge bridge and every kernel call.
+              corpusDbPath: ''
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
@@ -484,6 +500,10 @@
               extendedPromptSectionName: scope:extended-scientific-draft
               extendedPromptOrder: 12050
               researchDir: research
+              # Empty selects <researchDir>/corpus/records.sqlite; a set value is
+              # resolved against kernelRoot and forwarded as SCOPE_CORPUS_DB to
+              # the knowledge bridge and every kernel call.
+              corpusDbPath: ''
               pmidListPath: /data/disk1/zeiss/singlecell-quant/data/included_pmids_405.txt
               kernelTimeoutMs: 600000
               knowledgeTimeoutMs: 120000
